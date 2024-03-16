@@ -8,4 +8,4 @@ TODO
 
 ## License
 
-This plugin is released under an [MIT license](./license).
+This plugin is released under an [MIT license](./LICENSE).

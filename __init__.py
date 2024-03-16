@@ -1,5 +1,140 @@
 from binaryninja import *
+import enum
 
+header_template = """ # generated from ctypes_export Binary Ninja Plugin
+import enum
+import ctypes
+
+"""
+
+structunion_declaration_template = """class {prefix}{typename}({kind}):
+    _pack_ = 1
+"""
+
+structunion_definition_template = """{prefix}{typename}._fields_ = [
+    {items}
+]
+"""
+
+structunion_template = """class {prefix}{typename}({kind}):
+    _pack_ = 1
+    _fields_ = [
+        {items}
+    ]
+"""
+
+structunion_definition_template = """{prefix}{typename}._fields_ = [
+    {items}
+]
+"""
+
+enum_template = """class {prefix}{typename}(enum.IntEnum):
+{items}
+"""
+
+alias_template = """{prefix}{typename} = {equiv}"""
+
+# global to select on getting types from system types or debug info
+gt = None
+
+class TypeKind(enum.Enum):
+    STRUCT = 1
+    UNION = 2
+    ENUM = 3
+    ALIAS = 4
+
+    def baseclass(self):
+        if self == TypeKind.STRUCT:
+            return "ctypes.Structure"
+        if self == TypeKind.UNION:
+            return "ctypes.Union"
+        if self == TypeKind.ENUM:
+            return "enum.IntEnum"
+        raise KeyError(f"No baseclass for {self}")
+
+def get_type_kind(bv, tobj, tname):
+    tobj_type = type(tobj)
+    
+    if tobj_type == EnumerationType:
+        return TypeKind.ENUM
+
+    if tobj_type == StructureType:
+        if tobj.type == StructureVariant.UnionStructureType:
+            return TypeKind.UNION
+        return TypeKind.STRUCT
+
+    if tobj_type == NamedTypeReferenceType:
+        refobj = gt(bv, tname)
+        if refobj is None:
+            raise NameError(f"Could not find referenced type {tname}")
+        return get_type_kind(bv, refobj, tname)
+
+    if tobj_type in [ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType]:
+        return TypeKind.ALIAS
+    
+    raise NotImplementedError(f"Unimplemented export of type with tobj_type {tobj_type}")
+
+def get_structure_preitems(tobj, tname, prefix):
+    # define anonymous structures and unions for this type
+    #TODO
+    raise NotImplementedError()
+
+def get_structure_items(tobj, tname, prefix):
+    # define fields
+    #TODO
+    raise NotImplementedError()
+
+def get_enum_items(tobj):
+    # define enum options
+    #TODO
+    raise NotImplementedError()
+
+def get_alias_equiv(tobj):
+    # get ctypes equivalent string
+    #TODO
+    raise NotImplementedError()
+
+def declaration(bv, typename, typeobj, prefix):
+    print(f"DBG: declare {typename}")
+    kind = get_type_kind(bv, typeobj, typename)
+
+    if kind in [TypeKind.ENUM, TypeKind.ALIAS]:
+        raise Exception(f"Unexpected type needing a forward declaration? {kind}")
+    return structunion_declaration_template.format(prefix=prefix, typename=typename, kind=kind.baseclass())
+
+def part_definition(bv, typename, typeobj, prefix):
+    print(f"DBG: define {typename}")
+    kind = get_type_kind(bv, typeobj, typename)
+
+    if kind in [TypeKind.ENUM, TypeKind.ALIAS]:
+        raise Exception(f"Unexpected type needing a partial definition? {kind}")
+
+    preitems = get_structure_preitems(typeobj, typename, prefix)
+
+    items = get_structure_items(typeobj, typename, prefix)
+
+    return preitems + structunion_definition_template.format(prefix=prefix, typename=typename, items=items)
+
+def full_definition(bv, typename, typeobj, prefix):
+    print(f"DBG: {typename}")
+    kind = get_type_kind(bv, typeobj, typename)
+
+    if kind in [TypeKind.STRUCT, TypeKind.UNION]:
+
+        preitems = get_structure_preitems(typeobj, typename, prefix)
+
+        items = get_structure_items(typeobj, typename, prefix)
+
+        return preitems + structunion_template.format(prefix=prefix, typename=typename, kind=kind.baseclass(), items=items)
+
+    if kind == TypeKind.ENUM:
+        items = get_enum_items(typeobj)
+        return enum_template.format(prefix=prefix, typename=typename, items=items)
+
+    if kind == TypeKind.ALIAS:
+        equiv = get_alias_equiv(typeobj)
+        return alias_template.format(prefix=prefix, typename=typename, equiv=equiv)
+    raise NotImplementedError(f"Unimplemented definition for kind {kind}")
 
 def get_type_dbg(bv, typename):
     res = bv.debug_info.get_types_by_name(typename)
@@ -15,7 +150,7 @@ def get_type(bv, typename):
     # should we check and warn if there is a _1 variant?
     return bv.get_type_by_name(typename)
 
-def get_type_deps(bv, tobj, tname, gt):
+def get_type_deps(bv, tobj, tname):
     deps = set()
     tobj_type = type(tobj)
 
@@ -38,13 +173,13 @@ def get_type_deps(bv, tobj, tname, gt):
                 continue
 
             # otherwise we need to recurse and get the sub-types for dependencies
-            deps |= get_type_deps(bv, d_tobj, None, gt)
+            deps |= get_type_deps(bv, d_tobj, None)
     elif tobj_type == NamedTypeReferenceType:
         # recurse for referenced type
         refobj = gt(bv, tname)
         if refobj is None:
             raise NameError(f"Could not find referenced type {tname}")
-        deps = get_type_deps(bv, refobj, tname, gt)
+        deps = get_type_deps(bv, refobj, tname)
     elif tobj_type in [BoolType, CharType, EnumerationType, FloatType, IntegerType, VoidType, WideCharType]:
         # base types, no dependencies
         pass
@@ -58,14 +193,15 @@ def export_some(bv):
     rec_f = ChoiceField("Include Dependant Types", ["Yes", "No"], 0)
     dbg_f = ChoiceField("Use Only Debug Types", ["Yes", "No"], 1)
     pre_f = TextLineField("Class Name Prefix", "")
-    #TODO out_f = OpenFileNameField("Output File", ".py")
-    get_form_input([types_f, rec_f, dbg_f, pre_f], "Type Export")
+    out_f = OpenFileNameField("Output File", ".py", "")
+    get_form_input([types_f, rec_f, dbg_f, pre_f, out_f], "Type Export")
 
     if types_f.result is None or len(types_f.result) == 0:
         return False
 
     typenames = [x.strip() for x in types_f.result.split(',')]
 
+    global gt
     gt = get_type_dbg if dbg_f.result == 0 else get_type
 
     types = {}
@@ -80,7 +216,7 @@ def export_some(bv):
         types[tname] = tobj
 
         # get dependencies
-        tdeps = get_type_deps(bv, tobj, tname, gt)
+        tdeps = get_type_deps(bv, tobj, tname)
 
         # recurse as needed
         if rec_f.result == 0:
@@ -96,6 +232,7 @@ def export_some(bv):
     # now start generating our type definitions
     # we want to start with types that have no dependencies and continue until we have consumed all the types
     declared = []
+    report = ""
 
     while len(deps) > 0:
         # find an item with no deps
@@ -115,12 +252,10 @@ def export_some(bv):
             # still just generate the definitions
             # Circular type dependencies detected, adding forward declarations
             found = least
-            print("DBG: circ least:", found, deps[found])
 
             for dname in list(deps[found]):
                 # add the declaration (everything without the _fields_)
-                print(dname, "just declaration")
-                #TODO
+                report += declaration(bv, dname, types[dname], pre_f.result)
                 declared.append(dname)
 
                 # remove all the dependencies, but not the entries
@@ -128,21 +263,22 @@ def export_some(bv):
                     if dname in deps[tname]:
                         deps[tname].remove(dname)
             
-
-
         # generate
         if found in declared:
-            print(found, "just fields")
-            #TODO
+            report += part_definition(bv, found, types[found], pre_f.result)
         else:
-            print(found)
-            #TODO
+            report += full_definition(bv, found, types[found], pre_f.result)
 
         # remove the dependencies on this one
         del deps[found]
         for tname in deps:
             if found in deps[tname]:
                 deps[tname].remove(found)
+
+        
+        print("filename", out_f.result)
+        print(report)
+        #TODO output file or as report if empty filename
 
     return True
 
