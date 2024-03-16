@@ -1,7 +1,8 @@
 from binaryninja import *
 import enum
 
-header_template = """ # generated from ctypes_export Binary Ninja Plugin
+header_template = """ # generated from ctypes_export plugin
+# report issues to https://github.com/jordan9001/ctypes_export/issues
 import enum
 import ctypes
 
@@ -9,36 +10,42 @@ import ctypes
 
 structunion_declaration_template = """class {prefix}{typename}({kind}):
     _pack_ = 1
-"""
 
-structunion_definition_template = """{prefix}{typename}._fields_ = [
-    {items}
-]
 """
 
 structunion_template = """class {prefix}{typename}({kind}):
     _pack_ = 1
     _fields_ = [
-        {items}
-    ]
+{items}    ]
+
 """
 
 structunion_definition_template = """{prefix}{typename}._fields_ = [
-    {items}
-]
+{items}    ]
+
 """
 
-structunion_line_template = """    ('{name}', {equiv}),
+structunion_line_template = """        ('{name}', {equiv}),
 """
 
-enum_template = """class {prefix}{typename}(enum.IntEnum):
+enum_template = """class {prefix}{typename}_ENUM(enum.IntEnum):
 {items}
+
+{prefix}{typename} = ctypes.c_uint{intsz}
 """
 
-enum_line_template = """    {name} = {val}
+enum_line_template = """    {name} = 0x{val:x}
 """
 
-alias_template = """{prefix}{typename} = {equiv}"""
+alias_template = """{prefix}{typename} = {equiv}
+
+"""
+
+markdown_template = """
+```py
+{report}
+```
+"""
 
 # global to select on getting types from system types or debug info
 gt = None
@@ -93,7 +100,7 @@ def get_structunion_preitems(bv, tobj, tname, prefix):
     report = ""
     # define anonymous structures and unions for this type
     for m in tobj.members:
-        if m.type == StructureType:
+        if type(m.type) == StructureType:
             # this is not a NamedTypeReferenceType so it must be anonymous
             name = make_anon_name(m, tname)
             report += full_definition(bv, name, m.type, prefix)
@@ -101,7 +108,7 @@ def get_structunion_preitems(bv, tobj, tname, prefix):
     
     return report
 
-def structunion_line(structmem, parent, prefix):
+def structunion_line(structmem, parent, prefix, comment=""):
     name = structmem.name
     if len(name) == 0:
         name = f"__0x{structmem.offset:x}"
@@ -124,7 +131,9 @@ def structunion_line(structmem, parent, prefix):
         # ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType
         equiv = get_ctypes_equiv(structmem.type, prefix)
 
-    return structunion_line_template.format(name=name, equiv=equiv)
+    if len(comment) > 0:
+        comment = '# ' + comment
+    return structunion_line_template.format(name=name, equiv=equiv, comment=comment)
 
 def get_union_items(tobj, tname, prefix):
     items = ""
@@ -139,13 +148,16 @@ def get_struct_items(tobj, tname, prefix):
     # define fields
     offset = 0
     for m in tobj.members:
+        if offset > m.offset:
+            raise RuntimeError(f"Offsets disagree in structure?\n{offset} {m.offset}\n{repr(tobj.members)}")
         while offset < m.offset:
             # add padding
             items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8")
             offset += 1
 
         # add item
-        items += structunion_line(m, tname, prefix)
+        items += structunion_line(m, tname, prefix, comment=f"0x{offset:x}")
+        offset += m.type.width
         
     # pad at end
     while offset < tobj.width:
@@ -213,6 +225,7 @@ def get_ctypes_equiv(tobj, prefix):
         raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}")
 
 def full_deref(bv, tname, tobj):
+    #TODO these should be aliases instead
     while type(tobj) == NamedTypeReferenceType:
         tobj = gt(bv, tname)
         if type(tobj) == NamedTypeReferenceType:
@@ -220,18 +233,16 @@ def full_deref(bv, tname, tobj):
     return tobj, tname
 
 def declaration(bv, typename, typeobj, prefix):
-    print(f"DBG: declare {typename}")
     kind = get_type_kind(bv, typeobj, typename)
 
     if kind in [TypeKind.ENUM, TypeKind.ALIAS]:
-        raise Exception(f"Unexpected type needing a forward declaration? {kind}")
+        return full_definition(bv, typename, typeobj, prefix), False
     
     typeobj, _ = full_deref(bv, typename, typeobj)
 
-    return structunion_declaration_template.format(prefix=prefix, typename=typename, kind=kind.baseclass())
+    return structunion_declaration_template.format(prefix=prefix, typename=typename, kind=kind.baseclass()), True
 
 def part_definition(bv, typename, typeobj, prefix):
-    print(f"DBG: define {typename}")
     kind = get_type_kind(bv, typeobj, typename)
 
     if kind in [TypeKind.ENUM, TypeKind.ALIAS]:
@@ -250,7 +261,6 @@ def part_definition(bv, typename, typeobj, prefix):
     return preitems + structunion_definition_template.format(prefix=prefix, typename=typename, items=items)
 
 def full_definition(bv, typename, typeobj, prefix):
-    print(f"DBG: {typename}")
     kind = get_type_kind(bv, typeobj, typename)
 
     typeobj, _ = full_deref(bv, typename, typeobj)
@@ -269,7 +279,7 @@ def full_definition(bv, typename, typeobj, prefix):
 
     if kind == TypeKind.ENUM:
         items = get_enum_items(typeobj)
-        return enum_template.format(prefix=prefix, typename=typename, items=items)
+        return enum_template.format(prefix=prefix, typename=typename, items=items, intsz=(typeobj.width * 8))
 
     if kind == TypeKind.ALIAS:
         equiv = get_ctypes_equiv(typeobj, prefix)
@@ -314,6 +324,7 @@ def get_type_deps(bv, tobj, tname):
             # otherwise we need to recurse and get the sub-types for dependencies
             deps |= get_type_deps(bv, d_tobj, None)
     elif tobj_type == NamedTypeReferenceType:
+        #TODO make type aliases where needed
         # recurse for referenced type
         refobj = gt(bv, tname)
         if refobj is None:
@@ -332,7 +343,7 @@ def get_type_deps(bv, tobj, tname):
     return deps
 
 def export_some(bv):
-    types_f = MultilineTextField("Type Names (comma separated)")
+    types_f = MultilineTextField("Type Names (newline separated)")
     rec_f = ChoiceField("Include Dependant Types", ["Yes", "No"], 0)
     dbg_f = ChoiceField("Use Only Debug Types", ["Yes", "No"], 1)
     pre_f = TextLineField("Class Name Prefix", "")
@@ -342,7 +353,7 @@ def export_some(bv):
     if types_f.result is None or len(types_f.result) == 0:
         return False
 
-    typenames = [x.strip() for x in types_f.result.split(',')]
+    typenames = [x.strip() for x in types_f.result.split('\n')]
 
     global gt
     gt = get_type_dbg if dbg_f.result == 0 else get_type
@@ -375,7 +386,7 @@ def export_some(bv):
     # now start generating our type definitions
     # we want to start with types that have no dependencies and continue until we have consumed all the types
     declared = []
-    report = ""
+    report = header_template
 
     while len(deps) > 0:
         # find an item with no deps
@@ -398,8 +409,12 @@ def export_some(bv):
 
             for dname in list(deps[found]):
                 # add the declaration (everything without the _fields_)
-                report += declaration(bv, dname, types[dname], pre_f.result)
-                declared.append(dname)
+                piece, partial = declaration(bv, dname, types[dname], pre_f.result)
+                report += piece
+                if partial:
+                    declared.append(dname)
+                else:
+                    del deps[dname]
 
                 # remove all the dependencies, but not the entries
                 for tname in deps:
@@ -419,9 +434,14 @@ def export_some(bv):
                 deps[tname].remove(found)
 
         
-    print("filename", out_f.result)
-    print(report)
-    #TODO output file or as report if empty filename
+    filename = out_f.result
+    if len(filename) == 0:
+        show_markdown_report("Type Definitions", markdown_template.format(report=report), report)
+    else:
+        with open(filename, "w") as fp:
+            fp.write(report)
+    
+    print("ctypes export done")
 
     return True
 
