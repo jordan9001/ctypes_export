@@ -1,7 +1,7 @@
 from binaryninja import *
 import enum
 
-header_template = """ # generated from ctypes_export plugin
+header_template = """# generated from ctypes_export plugin
 # report issues to https://github.com/jordan9001/ctypes_export/issues
 import enum
 import ctypes
@@ -37,6 +37,12 @@ enum_template = """class {prefix}{typename}_ENUM(enum.IntEnum):
 enum_line_template = """    {name} = 0x{val:x}
 """
 
+alias_declaration_template = """# Forward declaration for {prefix}{typename}
+# {real}
+{prefix}{typename} = {equiv}
+
+"""
+
 alias_template = """{prefix}{typename} = {equiv}
 
 """
@@ -46,9 +52,6 @@ markdown_template = """
 {report}
 ```
 """
-
-# global to select on getting types from system types or debug info
-gt = None
 
 class TypeKind(enum.Enum):
     STRUCT = 1
@@ -77,15 +80,7 @@ def get_type_kind(bv, tobj, tname):
         return TypeKind.STRUCT
 
     if tobj_type == NamedTypeReferenceType:
-        refobj = gt(bv, tname)
-        if refobj is None:
-            raise NameError(f"Could not find referenced type {tname}")
-        
-        name = tname
-        if type(refobj) == NamedTypeReferenceType:
-            # do we need an alias here?
-            name = refobj.name
-        return get_type_kind(bv, refobj, name)
+        return TypeKind.ALIAS
 
     if tobj_type in [ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType]:
         return TypeKind.ALIAS
@@ -174,14 +169,38 @@ def get_enum_items(tobj):
 
     return items
 
-def get_ctypes_equiv(tobj, prefix):
+def equiv_basetype(tobj, prefix, declared, gt):
+    # tobj should always be a NamedTypeReferenceType in this function
+    # deref all the way and get the best fit
+    while type(tobj) == NamedTypeReferenceType:
+        if tobj.name in declared:
+            return prefix + tobj.name
+        tobj = gt(tobj.name)
+
+    # now, depending on the type, we can set something up
+    if type(tobj) == StructureType:
+        # I guess just say it is an array of bytes of a certain size?
+        return f"ctypes.c_uint8 * {tobj.width}"
+    if type(tobj) == EnumerationType:
+        if tobj.registered_name is None or tobj.registered_name.name not in declared:
+            return f"ctypes.c_uint{tobj.width * 8}"
+        else:
+            return prefix + tobj.registered_name.name
+
+    # otherwise drill down a bit more as possible
+    return get_ctypes_equiv(tobj, prefix, declared, gt)
+
+def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
     # get ctypes equivalent string
+    # if declared is not None, it means we want to do our best, but fall back to base types
 
     tobj_type = type(tobj)
     if tobj_type == NamedTypeReferenceType:
+        if declared is not None and tobj.name not in declared:
+            return equiv_basetype(tobj, prefix, declared, gt)
         return f"{prefix}{tobj.name}"
     elif tobj_type == ArrayType:
-        subtype = get_ctypes_equiv(tobj.element_type, prefix)
+        subtype = get_ctypes_equiv(tobj.element_type, prefix, declared, gt)
         return f"({subtype}) * {tobj.count}"
     elif tobj_type in [BoolType, CharType, IntegerType, WideCharType]:
         signed = False
@@ -192,14 +211,16 @@ def get_ctypes_equiv(tobj, prefix):
         if width not in [1,2,4,8]:
             raise NotImplementedError(f"got a int-like with a weird width: {width} {repr(tobj)}")
 
-        return f"ctypes.c_{'u' if not signed else ''}int{width*8}"
+        return f"ctypes.c_{'u' if not signed else ''}int{width * 8}"
     elif tobj_type == PointerType:
         # check for void target
         targ = tobj.target
         if type(targ) == VoidType:
             return "ctypes.c_void_p"
+        if declared is not None and type(targ) == NamedTypeReferenceType and targ.name not in declared:
+            return "ctypes.c_void_p"
 
-        subtype = get_ctypes_equiv(tobj.target, prefix)
+        subtype = get_ctypes_equiv(tobj.target, prefix, declared, gt)
         return f"ctypes.POINTER({subtype})"
     elif tobj_type == FloatType:
         floatsz = "float"
@@ -211,10 +232,10 @@ def get_ctypes_equiv(tobj, prefix):
             raise NotImplementedError(f"Unknown float with width {tobj.width} {repr(tobj)}")
         return f"ctypes.c_{floatsz}"
     elif tobj_type == FunctionType:
-        restype = get_ctypes_equiv(tobj.return_value, prefix)
-        argtypes = ','.join([get_ctypes_equiv(x.type, prefix) for x in tobj.parameters])
+        restype = get_ctypes_equiv(tobj.return_value, prefix, declared, gt)
+        argtypes = ','.join([get_ctypes_equiv(x.type, prefix, declared, gt) for x in tobj.parameters])
         #TODO calling convention information instead of just CFUNCTYPE
-        return f"CFUNCTYPE(({restype}), {argtypes})"
+        return f"ctypes.CFUNCTYPE(({restype}), {argtypes})"
     elif tobj_type == VoidType:
         # probably a function return value
         # just use void* whatever
@@ -224,31 +245,33 @@ def get_ctypes_equiv(tobj, prefix):
         # not in NamedTypeReference, ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, WideCharType
         raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}")
 
-def full_deref(bv, tname, tobj):
-    #TODO these should be aliases instead
-    while type(tobj) == NamedTypeReferenceType:
-        tobj = gt(bv, tname)
-        if type(tobj) == NamedTypeReferenceType:
-            tname = tobj.name
-    return tobj, tname
-
-def declaration(bv, typename, typeobj, prefix):
+def declaration(bv, typename, typeobj, prefix, declared, gt):
     kind = get_type_kind(bv, typeobj, typename)
 
-    if kind in [TypeKind.ENUM, TypeKind.ALIAS]:
+    if kind == TypeKind.ENUM:
         return full_definition(bv, typename, typeobj, prefix), False
-    
-    typeobj, _ = full_deref(bv, typename, typeobj)
 
+    if kind == TypeKind.ALIAS:
+        real = full_definition(bv, typename, typeobj, prefix)
+        # I can't forward declare aliases the way I am doing them
+        # but I can't full define them, because they can have dependencies
+        # so we alias to some equivalent type that is the same width
+        fake_equiv = get_ctypes_equiv(typeobj, prefix, declared, gt)
+
+        return alias_declaration_template.format(real=real, prefix=prefix, typename=typename, equiv=fake_equiv), True
+
+    # STRUCT and UNION
     return structunion_declaration_template.format(prefix=prefix, typename=typename, kind=kind.baseclass()), True
 
 def part_definition(bv, typename, typeobj, prefix):
     kind = get_type_kind(bv, typeobj, typename)
 
-    if kind in [TypeKind.ENUM, TypeKind.ALIAS]:
+    if kind == TypeKind.ENUM:
         raise Exception(f"Unexpected type needing a partial definition? {kind}")
 
-    typeobj, _ = full_deref(bv, typename, typeobj)
+    if kind == TypeKind.ALIAS:
+        # overwrite the stand in that has the equivalent sized types
+        return full_definition(bv, typename, typeobj, prefix)
 
     preitems = get_structunion_preitems(bv, typeobj, typename, prefix)
 
@@ -258,12 +281,11 @@ def part_definition(bv, typename, typeobj, prefix):
     elif kind == TypeKind.UNION:
         items = get_union_items(typeobj, typename, prefix)
 
+    # this doesn't always work, if the type or an alias are used as a non-pointer before this
     return preitems + structunion_definition_template.format(prefix=prefix, typename=typename, items=items)
 
 def full_definition(bv, typename, typeobj, prefix):
     kind = get_type_kind(bv, typeobj, typename)
-
-    typeobj, _ = full_deref(bv, typename, typeobj)
 
     if kind in [TypeKind.STRUCT, TypeKind.UNION]:
 
@@ -324,16 +346,8 @@ def get_type_deps(bv, tobj, tname):
             # otherwise we need to recurse and get the sub-types for dependencies
             deps |= get_type_deps(bv, d_tobj, None)
     elif tobj_type == NamedTypeReferenceType:
-        #TODO make type aliases where needed
-        # recurse for referenced type
-        refobj = gt(bv, tname)
-        if refobj is None:
-            raise NameError(f"Could not find referenced type {tname}")
-
-        name = tname
-        if type(refobj) == NamedTypeReferenceType:
-            name = refobj.name
-        deps = get_type_deps(bv, refobj, name)
+        # depend on the next step by it's name
+        deps.add(tobj.name)
     elif tobj_type in [BoolType, CharType, EnumerationType, FloatType, IntegerType, VoidType, WideCharType]:
         # base types, no dependencies
         pass
@@ -355,15 +369,16 @@ def export_some(bv):
 
     typenames = [x.strip() for x in types_f.result.split('\n')]
 
-    global gt
-    gt = get_type_dbg if dbg_f.result == 0 else get_type
+    gt_choice = get_type_dbg if dbg_f.result == 0 else get_type
+
+    gt = lambda tname: gt_choice(bv, tname)
 
     types = {}
     # this is edges for the dependency graph
     # because the output has to be in order
     deps = {}
     for tname in typenames:
-        tobj = gt(bv, tname)
+        tobj = gt(tname)
         if tobj is None:
             print(f"Error: Could not find type {tname}")
             continue
@@ -385,7 +400,7 @@ def export_some(bv):
 
     # now start generating our type definitions
     # we want to start with types that have no dependencies and continue until we have consumed all the types
-    declared = []
+    declared = set()
     report = header_template
 
     while len(deps) > 0:
@@ -403,17 +418,22 @@ def export_some(bv):
                 break
 
         if found is None:
+            if least is None:
+                print("Found Dependency errors, trying anyways")
+                least = deps.keys()[0]
+
             # still just generate the definitions
             # Circular type dependencies detected, adding forward declarations
             found = least
 
+            print("DBG: Could not find, have to fwd declare for", found)
             for dname in list(deps[found]):
+                print("DBG: FWD for", dname)
                 # add the declaration (everything without the _fields_)
-                piece, partial = declaration(bv, dname, types[dname], pre_f.result)
+                piece, partial = declaration(bv, dname, types[dname], pre_f.result, declared, gt)
                 report += piece
-                if partial:
-                    declared.append(dname)
-                else:
+                declared.add(dname)
+                if not partial:
                     del deps[dname]
 
                 # remove all the dependencies, but not the entries
@@ -426,6 +446,7 @@ def export_some(bv):
             report += part_definition(bv, found, types[found], pre_f.result)
         else:
             report += full_definition(bv, found, types[found], pre_f.result)
+            declared.add(found)
 
         # remove the dependencies on this one
         del deps[found]
