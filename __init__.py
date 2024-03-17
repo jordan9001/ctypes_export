@@ -321,8 +321,18 @@ def get_type(bv, typename):
     # should we check and warn if there is a _1 variant?
     return bv.get_type_by_name(typename)
 
-def get_type_deps(bv, tobj, tname):
-    deps = set()
+def is_ptr_alias(tobj, gt):
+    while type(tobj) == NamedTypeReferenceType:
+        tobj = gt(tobj.name)
+
+    if type(tobj) in [FunctionType, PointerType]:
+        return True
+
+    return False
+
+def get_type_deps(bv, tobj, tname, gt):
+    strong_deps = set()
+    weak_deps = set()
     tobj_type = type(tobj)
 
     #ArrayType, BoolType, CharType, EnumerationType, FloatType, FunctionType, IntegerType, NamedTypeReferenceType, PointerType, StructureType, VoidType, WideCharType
@@ -333,28 +343,43 @@ def get_type_deps(bv, tobj, tname):
         for d_tobj in tobj.children:
             if type(d_tobj) == NamedTypeReferenceType:
                 # if this is a reference, add a dependency on the name
-                deps.add(d_tobj.name)
+                # we need to find out if this is a strong dep or a weak dep
+                if tobj_type in [FunctionType, PointerType]:
+                    weak_deps.add(d_tobj.name)
+                else:
+                    strong_deps.add(d_tobj.name)
                 continue
             if d_tobj.registered_name != None:
                 # if this is known by a name, we want to capture that 
-                deps.add(d_tobj.registered_name.name)
+                # we need to find out if this is a strong dep or a weak dep
+                if tobj_type in [FunctionType, PointerType]:
+                    weak_deps.add(d_tobj.registered_name.name)
+                else:
+                    strong_deps.add(d_tobj.registered_name.name)
                 continue
             # ignore base type deps with no name
             if type(d_tobj) in [BoolType, CharType, EnumerationType, FloatType, IntegerType, VoidType, WideCharType]:
                 continue
 
             # otherwise we need to recurse and get the sub-types for dependencies
-            deps |= get_type_deps(bv, d_tobj, None)
+            child_strong_deps, child_weak_deps = get_type_deps(bv, d_tobj, None, gt)
+            if tobj_type in [FunctionType, PointerType]:
+                # these are all made weak through a pointer
+                weak_deps |= child_strong_deps | child_weak_deps
+            else:
+                strong_deps |= child_strong_deps
+                weak_deps |= child_weak_deps
     elif tobj_type == NamedTypeReferenceType:
         # depend on the next step by it's name
-        deps.add(tobj.name)
+        # find if it is a strong dep or a weak dep
+        strong_deps.add(tobj.name)
     elif tobj_type in [BoolType, CharType, EnumerationType, FloatType, IntegerType, VoidType, WideCharType]:
         # base types, no dependencies
         pass
     else:
         raise NotImplementedError(f"Getting Dependancies not implemented for type type {str(tobj_type)}")
 
-    return deps
+    return strong_deps, weak_deps
 
 def export_some(bv):
     types_f = MultilineTextField("Type Names (newline separated)")
@@ -376,7 +401,10 @@ def export_some(bv):
     types = {}
     # this is edges for the dependency graph
     # because the output has to be in order
-    deps = {}
+    strong_deps = {}
+    # stong deps are real
+    # weak deps are thorugh pointers
+    weak_deps = {}
     for tname in typenames:
         tobj = gt(tname)
         if tobj is None:
@@ -385,63 +413,116 @@ def export_some(bv):
         types[tname] = tobj
 
         # get dependencies
-        tdeps = get_type_deps(bv, tobj, tname)
+        strong_tdeps, weak_tdeps = get_type_deps(bv, tobj, tname, gt)
 
         # recurse as needed
         if rec_f.result == 0:
-            for d in tdeps:
+            for d in strong_tdeps:
+                if d not in typenames:
+                    typenames.append(d)
+            for d in weak_tdeps:
                 if d not in typenames:
                     typenames.append(d)
         else:
             # if not recursing, we still want good order for deps between included types
-            tdeps = tdeps.intersection(set(typenames))
+            strong_tdeps = strong_tdeps.intersection(set(typenames))
+            weak_tdeps = weak_tdeps.intersection(set(typenames))
 
-        deps[tname] = tdeps
+        strong_deps[tname] = strong_tdeps
+        weak_deps[tname] = weak_tdeps
+
+        print("DBG:", tname, "strong:", strong_deps[tname])
+        print("DBG:", tname, "weak:", weak_deps[tname])
 
     # now start generating our type definitions
     # we want to start with types that have no dependencies and continue until we have consumed all the types
     declared = set()
     report = header_template
 
-    while len(deps) > 0:
-        # find an item with no deps
+    while (len(strong_deps) + len(weak_deps)) > 0:
+        # try to find an item with no deps
+        # if not that, find the item with the fewest strong_deps and the fewest weak_deps prioritizing fewest strong_deps
+
         found = None
-        least_amt = -1
+        least_strong = -1
+        least_weak = -1
         least = None
-        for tname in deps:
-            depcount = len(deps[tname])
-            if least_amt == -1 or depcount < least_amt:
-                least_amt = depcount
-                least = tname
-            if len(deps[tname]) == 0:
+
+        for tname in strong_deps:
+            strong_depcount = len(strong_deps[tname])
+            weak_depcount = len(weak_deps[tname])
+
+            if strong_depcount + weak_depcount == 0:
                 found = tname
                 break
+
+            if least_strong == -1 or strong_depcount <= least_strong:
+                if least_weak == -1 or strong_depcount < least_strong or weak_depcount < least_weak:
+                    least_weak = weak_depcount
+                    least_strong = strong_depcount
+                    least = tname
+
+        #TODO
+        # what we want is to find the structure node that is most depended upon weakly (through pointers)
+        # so we know it won't get instantiated before it gets defined
+        # (we should have a priority list for resolving ties, moving definitions closer to declarations)
+        # so we need to have reverse edges
+        # we could just count those reverse to find no reverse strong and many reverse weak?
+        # or is there a better way?
 
         if found is None:
             if least is None:
                 print("Found Dependency errors, trying anyways")
-                least = deps.keys()[0]
+                least = strong_deps.keys()[0]
 
             # still just generate the definitions
             # Circular type dependencies detected, adding forward declarations
             found = least
 
+            #TODO
+            # here I am just guessing that because this has a weak ref, nothing else has a strong ref?
+            # in reality I need to prioritize fwd defining ones that no one has strong refs to, but lots of nodes have weak refs to
+            #TODO
+
             print("DBG: Could not find, have to fwd declare for", found)
-            for dname in list(deps[found]):
-                print("DBG: FWD for", dname)
+            # first go through and forward declare weak deps, then the strong ones
+            for dname in list(weak_deps[found]):
+                print("DBG: FWD for weak", dname)
                 # add the declaration (everything without the _fields_)
                 piece, partial = declaration(bv, dname, types[dname], pre_f.result, declared, gt)
                 report += piece
                 declared.add(dname)
                 if not partial:
-                    del deps[dname]
+                    del strong_deps[dname]
+                    del weak_deps[dname]
 
-                # remove all the dependencies, but not the entries
-                for tname in deps:
-                    if dname in deps[tname]:
-                        deps[tname].remove(dname)
+                # remove all the dependencies on this now that it is fwd declared
+                for tname in strong_deps:
+                    if dname in strong_deps[tname]:
+                        strong_deps[tname].remove(dname)
+                    if dname in weak_deps[tname]:
+                        weak_deps[tname].remove(dname)
+
+            for dname in list(strong_deps[found]):
+                print("DBG: FWD for strong", dname)
+                # add the declaration (everything without the _fields_)
+                piece, partial = declaration(bv, dname, types[dname], pre_f.result, declared, gt)
+                report += piece
+                declared.add(dname)
+                if not partial:
+                    del strong_deps[dname]
+                    del weak_deps[dname]
+
+                # remove all the dependencies on this now that it is fwd declared
+                for tname in strong_deps:
+                    if dname in strong_deps[tname]:
+                        strong_deps[tname].remove(dname)
+                    if dname in weak_deps[tname]:
+                        weak_deps[tname].remove(dname)
+
             
         # generate
+        print("DBG: gen", found)
         if found in declared:
             report += part_definition(bv, found, types[found], pre_f.result)
         else:
@@ -449,12 +530,14 @@ def export_some(bv):
             declared.add(found)
 
         # remove the dependencies on this one
-        del deps[found]
-        for tname in deps:
-            if found in deps[tname]:
-                deps[tname].remove(found)
+        del strong_deps[found]
+        del weak_deps[found]
+        for tname in strong_deps:
+            if found in strong_deps[tname]:
+                strong_deps[tname].remove(found)
+            if found in weak_deps[tname]:
+                weak_deps[tname].remove(found)
 
-        
     filename = out_f.result
     if len(filename) == 0:
         show_markdown_report("Type Definitions", markdown_template.format(report=report), report)
