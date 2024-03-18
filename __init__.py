@@ -68,7 +68,13 @@ class TypeKind(enum.Enum):
             return "enum.IntEnum"
         raise KeyError(f"No baseclass for {self}")
 
-def get_type_kind(bv, tobj, tname):
+class DefType(enum.Enum):
+    FULL = 1
+    FWD_STRUCT = 2
+    FWD_OTHER = 3
+    PART = 4
+
+def get_type_kind(tobj, tname):
     tobj_type = type(tobj)
     
     if tobj_type == EnumerationType:
@@ -91,14 +97,14 @@ def make_anon_name(structmem, parent):
     name = f'{parent}__0x{structmem.offset:x}'
     return name
 
-def get_structunion_preitems(bv, tobj, tname, prefix):
+def get_structunion_preitems(tobj, tname, prefix):
     report = ""
     # define anonymous structures and unions for this type
     for m in tobj.members:
         if type(m.type) == StructureType:
             # this is not a NamedTypeReferenceType so it must be anonymous
             name = make_anon_name(m, tname)
-            report += full_definition(bv, name, m.type, prefix)
+            report += full_definition(name, m.type, prefix)
         #TODO handle unnamed structures used in pointer, arrays, functions
     
     return report
@@ -245,14 +251,14 @@ def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
         # not in NamedTypeReference, ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, WideCharType
         raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}")
 
-def declaration(bv, typename, typeobj, prefix, declared, gt):
-    kind = get_type_kind(bv, typeobj, typename)
+def declaration(typename, typeobj, prefix, declared, gt):
+    kind = get_type_kind(typeobj, typename)
 
     if kind == TypeKind.ENUM:
-        return full_definition(bv, typename, typeobj, prefix), False
+        return full_definition(typename, typeobj, prefix), False
 
     if kind == TypeKind.ALIAS:
-        real = full_definition(bv, typename, typeobj, prefix)
+        real = full_definition(typename, typeobj, prefix)
         # I can't forward declare aliases the way I am doing them
         # but I can't full define them, because they can have dependencies
         # so we alias to some equivalent type that is the same width
@@ -263,17 +269,17 @@ def declaration(bv, typename, typeobj, prefix, declared, gt):
     # STRUCT and UNION
     return structunion_declaration_template.format(prefix=prefix, typename=typename, kind=kind.baseclass()), True
 
-def part_definition(bv, typename, typeobj, prefix):
-    kind = get_type_kind(bv, typeobj, typename)
+def part_definition(typename, typeobj, prefix):
+    kind = get_type_kind(typeobj, typename)
 
     if kind == TypeKind.ENUM:
         raise Exception(f"Unexpected type needing a partial definition? {kind}")
 
     if kind == TypeKind.ALIAS:
         # overwrite the stand in that has the equivalent sized types
-        return full_definition(bv, typename, typeobj, prefix)
+        return full_definition(typename, typeobj, prefix)
 
-    preitems = get_structunion_preitems(bv, typeobj, typename, prefix)
+    preitems = get_structunion_preitems(typeobj, typename, prefix)
 
     items = ""
     if kind == TypeKind.STRUCT:
@@ -284,12 +290,12 @@ def part_definition(bv, typename, typeobj, prefix):
     # this doesn't always work, if the type or an alias are used as a non-pointer before this
     return preitems + structunion_definition_template.format(prefix=prefix, typename=typename, items=items)
 
-def full_definition(bv, typename, typeobj, prefix):
-    kind = get_type_kind(bv, typeobj, typename)
+def full_definition(typename, typeobj, prefix):
+    kind = get_type_kind(typeobj, typename)
 
     if kind in [TypeKind.STRUCT, TypeKind.UNION]:
 
-        preitems = get_structunion_preitems(bv, typeobj, typename, prefix)
+        preitems = get_structunion_preitems(typeobj, typename, prefix)
 
         items = ""
         if kind == TypeKind.STRUCT:
@@ -330,7 +336,7 @@ def is_ptr_alias(tobj, gt):
 
     return False
 
-def get_type_deps(bv, tobj, tname, gt):
+def get_type_deps(tobj, tname, gt):
     strong_deps = set()
     weak_deps = set()
     tobj_type = type(tobj)
@@ -362,7 +368,7 @@ def get_type_deps(bv, tobj, tname, gt):
                 continue
 
             # otherwise we need to recurse and get the sub-types for dependencies
-            child_strong_deps, child_weak_deps = get_type_deps(bv, d_tobj, None, gt)
+            child_strong_deps, child_weak_deps = get_type_deps(d_tobj, None, gt)
             if tobj_type in [FunctionType, PointerType]:
                 # these are all made weak through a pointer
                 weak_deps |= child_strong_deps | child_weak_deps
@@ -381,12 +387,294 @@ def get_type_deps(bv, tobj, tname, gt):
 
     return strong_deps, weak_deps
 
+def update_deps(tname, full_def, strong_deps, weak_deps, rev_strong_deps, rev_weak_deps):
+    print("DBG: Update deps for", tname, full_def, strong_deps[tname], rev_strong_deps[tname], weak_deps[tname], rev_weak_deps[tname], sep='\n\t')
+
+    # first remove weak dependencies on this type
+    # if this is a fwd declaration, it allowed those types to be created now
+    rwdlist = list(rev_weak_deps[tname])
+    for othername in rwdlist:
+        weak_deps[othername].remove(tname)
+        rev_weak_deps[tname].remove(othername)
+
+    if full_def:
+        # if we have fully defined it, then we can just remove this from all lists
+
+        wdlist = list(weak_deps[tname])
+        for othername in wdlist:
+            rev_weak_deps[othername].remove(tname)
+
+        rsdlist = list(rev_strong_deps[tname])
+        for othername in rsdlist:
+            strong_deps[othername].remove(tname)
+
+        sdlist = list(strong_deps[tname])
+        for othername in sdlist:
+            rev_strong_deps[othername].remove(tname)
+        # don't remove these if it is a fwd declaration
+        # because we still need to define it later
+        del strong_deps[tname]
+        del weak_deps[tname]
+        del rev_strong_deps[tname]
+        del rev_weak_deps[tname]
+
+def get_order(types, strong_deps, weak_deps, gt, rev_strong_deps=None, rev_weak_deps=None):
+    # all *_deps should always have the same keys
+
+    # first calc the rev_strong_deps and friends if needed
+
+    if rev_strong_deps is None:
+        rev_strong_deps = {}
+        rev_weak_deps = {}
+        for tname in strong_deps:
+            rev_strong_deps[tname] = set()
+            rev_weak_deps[tname] = set()
+        for tname in strong_deps:
+            for rd in strong_deps[tname]:
+                rev_strong_deps[rd].add(tname)
+            for rd in weak_deps[tname]:
+                rev_weak_deps[rd].add(tname)
+
+    predefd = []
+
+    order = []
+    while len(strong_deps) > 0:
+        found = False
+
+        best_score = None
+        best = None
+
+        for tname in strong_deps:
+            sd_count = len(strong_deps[tname])
+            wd_count = len(weak_deps[tname])
+            rsd_count = len(rev_strong_deps[tname])
+            rwd_count = len(rev_weak_deps[tname])
+            is_structunion = type(types[tname]) == StructureType
+
+            #print("DBG: Try with", tname, sd_count, wd_count, rsd_count, rwd_count, is_structunion)
+            # first go through the ones we know we can, that have no dependencies
+
+            if sd_count + wd_count == 0:
+                dt = DefType.FULL
+                if tname in predefd:
+                    dt = DefType.PART
+                order.append((tname, dt))
+
+                update_deps(tname, True, strong_deps, weak_deps, rev_strong_deps, rev_weak_deps)
+                found = True
+                break
+
+            if sd_count == 0 and wd_count == 1 and tname in weak_deps[tname]:
+                # special test for items with one self dep
+
+                dt = DefType.FWD_OTHER
+                if is_structunion:
+                    dt = DefType.FWD_STRUCT
+
+                order.append((tname, dt))
+                order.append((tname, DefType.PART))
+
+                update_deps(tname, True, strong_deps, weak_deps, rev_strong_deps, rev_weak_deps)
+                found = True
+                break
+
+            # otherwise we have gone through those we can do safely
+            # now we need to choose something to forward declare to keep things moving
+            
+
+            """
+            pt1 = *t1
+            t2 { pt1, t1 }
+            t3 { t1 }
+            t1 { t2 }
+
+            t1:
+                sd t2
+                wd 
+                rsd t3
+                rwd pt1
+            t2:
+                sd pt1
+                wd
+                rsd t1
+                rwd
+            t3: 
+                sd t1
+                wd
+                rsd
+                rwd
+            pt1:
+                sd
+                wd t1
+                rsd t2
+                rwd 
+
+            -- t1 fwd declared -- 
+
+            t1:
+                sd t2
+                rsd t3
+            t2:
+                sd pt1
+                wd
+                rsd t1
+                rwd
+            t3: 
+                sd t1
+                wd
+                rsd
+                rwd
+            pt1:
+                sd
+                wd
+                rsd t2
+                rwd
+
+            -- pt1 declared --
+
+            t1:
+                sd t2
+                rsd t3
+            t2:
+                sd
+                wd
+                rsd t1
+                rwd
+            t3: 
+                sd t1
+                wd
+                rsd
+                rwd
+
+            -- t2 declared -- 
+
+            t1:
+                sd
+                rsd t3
+            t3: 
+                sd t1
+                wd
+                rsd
+                rwd
+
+            -- t1 declared --
+
+            -- t3 declared -- 
+            
+            
+            
+            """
+
+            # we want to end up with a ordered list of what we want to try to fwd decalre
+            # it should be like:
+            """
+            Priority
+                ordered by if it is a structure
+                ordered by how much of an item it would ready (items with only wd)
+                ordered by number of rev wd (more is better)
+                ordered by lower sd_count
+                ordered by lower rev sd
+                ordered by lower wd
+            """
+            
+            # ignore any that are already fwd declared
+            if tname in predefd:
+                continue
+
+            ready_amt = 0
+            # for everything that depends on this, see how many others they depend on
+            for other in rev_weak_deps[tname]:
+                o_ready_amt = len(weak_deps[other])
+                if ready_amt == 0 or o_ready_amt < ready_amt:
+                    ready_amt = o_ready_amt
+
+            score = (is_structunion, ready_amt, rwd_count, sd_count, rsd_count, wd_count)
+
+            if best_score is None:
+                best_score = score
+                best = tname
+                continue
+
+            # is_structunion
+            if best_score[0] and not score[0]:
+                continue
+            if score[0] and not best_score[0]:
+                best_score = score
+                best = tname
+                continue
+
+            # ready_amt
+            if (best_score[1] != 0) and (score[1] == 0 or score[1] > best_score[1]):
+                continue
+            if (score[1] != 0) and (best_score[1] == 0 or best_score[1] > score[1]):
+                best_score = score
+                best = tname
+                continue
+
+            # rwd_count
+            if best_score[2] > score[2]:
+                continue
+            if score[2] > best_score[2]:
+                best_score = score
+                best = tname
+                continue
+
+            # sd_count
+            if best_score[3] < score[3]:
+                continue
+            if score[3] < best_score[3]:
+                best_score = score
+                best = tname
+                continue
+
+            # rsd_count
+            if best_score[4] < score[4]:
+                continue
+            if score[4] < best_score[4]:
+                best_score = score
+                best = tname
+                continue
+
+            # wd_count
+            if best_score[5] < score[5]:
+                continue
+            if score[5] < best_score[5]:
+                best_score = score
+                best = tname
+                continue
+
+            # A tie!
+            continue
+
+        if found:
+            continue
+
+        # fwd declare best
+        #TODO do we have to search multiple possibilities? Or isn't this enough?
+
+        if best is None:
+            print("DEBUG: Unable to move forward")
+            print(predefd)
+            for tname in strong_deps:
+                print(tname, strong_deps[tname], weak_deps[tname], sep='\n\t')
+            raise RuntimeError("Strong Circular Dependency?")
+
+        dt = DefType.FWD_OTHER
+        if best_score[0]:
+            dt = DefType.FWD_STRUCT
+
+        order.append((best, dt))
+        predefd.append(best)
+        update_deps(best, False, strong_deps, weak_deps, rev_strong_deps, rev_weak_deps)
+
+    return order
+
 def export_some(bv):
     types_f = MultilineTextField("Type Names (newline separated)")
     rec_f = ChoiceField("Include Dependant Types", ["Yes", "No"], 0)
     dbg_f = ChoiceField("Use Only Debug Types", ["Yes", "No"], 1)
     pre_f = TextLineField("Class Name Prefix", "")
-    out_f = OpenFileNameField("Output File", ".py", "")
+    out_f = SaveFileNameField("Output File", "py", "")
     get_form_input([types_f, rec_f, dbg_f, pre_f, out_f], "Type Export")
 
     if types_f.result is None or len(types_f.result) == 0:
@@ -413,7 +701,7 @@ def export_some(bv):
         types[tname] = tobj
 
         # get dependencies
-        strong_tdeps, weak_tdeps = get_type_deps(bv, tobj, tname, gt)
+        strong_tdeps, weak_tdeps = get_type_deps(tobj, tname, gt)
 
         # recurse as needed
         if rec_f.result == 0:
@@ -435,108 +723,26 @@ def export_some(bv):
         print("DBG:", tname, "weak:", weak_deps[tname])
 
     # now start generating our type definitions
-    # we want to start with types that have no dependencies and continue until we have consumed all the types
-    declared = set()
+
+    # first we need to find an order that works
+    types_order = get_order(types, strong_deps, weak_deps, gt)
+
     report = header_template
+    prefix = pre_f.result
 
-    while (len(strong_deps) + len(weak_deps)) > 0:
-        # try to find an item with no deps
-        # if not that, find the item with the fewest strong_deps and the fewest weak_deps prioritizing fewest strong_deps
-
-        found = None
-        least_strong = -1
-        least_weak = -1
-        least = None
-
-        for tname in strong_deps:
-            strong_depcount = len(strong_deps[tname])
-            weak_depcount = len(weak_deps[tname])
-
-            if strong_depcount + weak_depcount == 0:
-                found = tname
-                break
-
-            if least_strong == -1 or strong_depcount <= least_strong:
-                if least_weak == -1 or strong_depcount < least_strong or weak_depcount < least_weak:
-                    least_weak = weak_depcount
-                    least_strong = strong_depcount
-                    least = tname
-
-        #TODO
-        # what we want is to find the structure node that is most depended upon weakly (through pointers)
-        # so we know it won't get instantiated before it gets defined
-        # (we should have a priority list for resolving ties, moving definitions closer to declarations)
-        # so we need to have reverse edges
-        # we could just count those reverse to find no reverse strong and many reverse weak?
-        # or is there a better way?
-
-        if found is None:
-            if least is None:
-                print("Found Dependency errors, trying anyways")
-                least = strong_deps.keys()[0]
-
-            # still just generate the definitions
-            # Circular type dependencies detected, adding forward declarations
-            found = least
-
-            #TODO
-            # here I am just guessing that because this has a weak ref, nothing else has a strong ref?
-            # in reality I need to prioritize fwd defining ones that no one has strong refs to, but lots of nodes have weak refs to
-            #TODO
-
-            print("DBG: Could not find, have to fwd declare for", found)
-            # first go through and forward declare weak deps, then the strong ones
-            for dname in list(weak_deps[found]):
-                print("DBG: FWD for weak", dname)
-                # add the declaration (everything without the _fields_)
-                piece, partial = declaration(bv, dname, types[dname], pre_f.result, declared, gt)
-                report += piece
-                declared.add(dname)
-                if not partial:
-                    del strong_deps[dname]
-                    del weak_deps[dname]
-
-                # remove all the dependencies on this now that it is fwd declared
-                for tname in strong_deps:
-                    if dname in strong_deps[tname]:
-                        strong_deps[tname].remove(dname)
-                    if dname in weak_deps[tname]:
-                        weak_deps[tname].remove(dname)
-
-            for dname in list(strong_deps[found]):
-                print("DBG: FWD for strong", dname)
-                # add the declaration (everything without the _fields_)
-                piece, partial = declaration(bv, dname, types[dname], pre_f.result, declared, gt)
-                report += piece
-                declared.add(dname)
-                if not partial:
-                    del strong_deps[dname]
-                    del weak_deps[dname]
-
-                # remove all the dependencies on this now that it is fwd declared
-                for tname in strong_deps:
-                    if dname in strong_deps[tname]:
-                        strong_deps[tname].remove(dname)
-                    if dname in weak_deps[tname]:
-                        weak_deps[tname].remove(dname)
-
-            
-        # generate
-        print("DBG: gen", found)
-        if found in declared:
-            report += part_definition(bv, found, types[found], pre_f.result)
+    declared = set()
+    # gen report from order and types
+    for tname, linekind in types_order:
+        if linekind == DefType.FULL:
+            report += full_definition(tname, types[tname], prefix)
+        elif linekind == DefType.PART:
+            report += part_definition(tname, types[tname], prefix)
         else:
-            report += full_definition(bv, found, types[found], pre_f.result)
-            declared.add(found)
+            decl, _ = declaration(tname, types[tname], prefix, declared, gt)
+            report += decl
 
-        # remove the dependencies on this one
-        del strong_deps[found]
-        del weak_deps[found]
-        for tname in strong_deps:
-            if found in strong_deps[tname]:
-                strong_deps[tname].remove(found)
-            if found in weak_deps[tname]:
-                weak_deps[tname].remove(found)
+        declared.add(tname)
+
 
     filename = out_f.result
     if len(filename) == 0:
