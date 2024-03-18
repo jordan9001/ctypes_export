@@ -1,4 +1,5 @@
 from binaryninja import *
+import fnmatch
 import enum
 
 header_template = """# generated from ctypes_export plugin
@@ -25,7 +26,7 @@ structunion_definition_template = """{prefix}{typename}._fields_ = [
 
 """
 
-structunion_line_template = """        ('{name}', {equiv}),
+structunion_line_template = """        ('{name}', {equiv}),{comment}
 """
 
 enum_template = """class {prefix}{typename}_ENUM(enum.IntEnum):
@@ -93,23 +94,29 @@ def get_type_kind(tobj, tname):
     
     raise NotImplementedError(f"Unimplemented export of type with tobj_type {tobj_type}")
 
-def make_anon_name(structmem, parent):
-    name = f'{parent}__0x{structmem.offset:x}'
+def make_anon_name(structmem, nth, parent, parent_type):
+    name = ""
+    if parent_type.type == StructureVariant.UnionStructureType:
+        # can't use offset, have to use order index
+        name = f'{parent}__u{nth}'
+    else:
+        name = f'{parent}__0x{structmem.offset:x}'
     return name
 
 def get_structunion_preitems(tobj, tname, prefix):
     report = ""
     # define anonymous structures and unions for this type
-    for m in tobj.members:
-        if type(m.type) == StructureType:
+    for i in range(len(tobj.members)):
+        m = tobj.members[i]
+        if type(m.type) in [StructureType, EnumerationType]:
             # this is not a NamedTypeReferenceType so it must be anonymous
-            name = make_anon_name(m, tname)
+            name = make_anon_name(m, i, tname, tobj)
             report += full_definition(name, m.type, prefix)
         #TODO handle unnamed structures used in pointer, arrays, functions
     
     return report
 
-def structunion_line(structmem, parent, prefix, comment=""):
+def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
     name = structmem.name
     if len(name) == 0:
         name = f"__0x{structmem.offset:x}"
@@ -122,12 +129,13 @@ def structunion_line(structmem, parent, prefix, comment=""):
         # use the name
         equiv = f"{prefix}{structmem.type.name}"
     elif mobj_type == StructureType:
-        equiv = prefix + make_anon_name(structmem, parent)
+        equiv = prefix + make_anon_name(structmem, nth, parent, parent_type)
     elif mobj_type == EnumerationType:
         tref = structmem.type.registered_name
         if tref is None:
-            raise NotImplementedError("Unhandled case, raw enumeration type in structure member with no registered name")
-        equiv = f"{prefix}{tref.name}"
+            equiv = prefix + make_anon_name(structmem, nth, parent, parent_type)
+        else:
+            equiv = f"{prefix}{tref.name}"
     else:
         # ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType
         equiv = get_ctypes_equiv(structmem.type, prefix)
@@ -139,8 +147,9 @@ def structunion_line(structmem, parent, prefix, comment=""):
 def get_union_items(tobj, tname, prefix):
     items = ""
 
-    for m in tobj.members:
-        items += structunion_line(m, tname, prefix)
+    for i in range(len(tobj.members)):
+        m = tobj.members[i]
+        items += structunion_line(m, i, tname, tobj, prefix)
 
     return items
 
@@ -148,21 +157,24 @@ def get_struct_items(tobj, tname, prefix):
     items = ""
     # define fields
     offset = 0
-    for m in tobj.members:
+    for i in range(len(tobj.members)):
+        m = tobj.members[i]
         if offset > m.offset:
             raise RuntimeError(f"Offsets disagree in structure?\n{offset} {m.offset}\n{repr(tobj.members)}")
         while offset < m.offset:
             # add padding
-            items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8")
+            #TODO compress padding over a certain length to an array
+            items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8", comment="")
             offset += 1
 
         # add item
-        items += structunion_line(m, tname, prefix, comment=f"0x{offset:x}")
+        items += structunion_line(m, i, tname, tobj, prefix, comment=f"0x{offset:x}")
         offset += m.type.width
         
     # pad at end
     while offset < tobj.width:
-        items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8")
+        #TODO compress padding over a certain length to an array
+        items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8", comment="")
         offset += 1
 
     return items
@@ -248,6 +260,7 @@ def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
         return "ctypes.c_void_p"
 
     else:
+        #TODO handle arrays of anon structures and such predefined in preitems
         # not in NamedTypeReference, ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, WideCharType
         raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}")
 
@@ -388,7 +401,6 @@ def get_type_deps(tobj, tname, gt):
     return strong_deps, weak_deps
 
 def update_deps(tname, full_def, strong_deps, weak_deps, rev_strong_deps, rev_weak_deps):
-    print("DBG: Update deps for", tname, full_def, strong_deps[tname], rev_strong_deps[tname], weak_deps[tname], rev_weak_deps[tname], sep='\n\t')
 
     # first remove weak dependencies on this type
     # if this is a fwd declaration, it allowed those types to be created now
@@ -418,7 +430,7 @@ def update_deps(tname, full_def, strong_deps, weak_deps, rev_strong_deps, rev_we
         del rev_strong_deps[tname]
         del rev_weak_deps[tname]
 
-def get_order(types, strong_deps, weak_deps, gt, rev_strong_deps=None, rev_weak_deps=None):
+def get_order(types, strong_deps, weak_deps, rev_strong_deps=None, rev_weak_deps=None):
     # all *_deps should always have the same keys
 
     # first calc the rev_strong_deps and friends if needed
@@ -451,7 +463,6 @@ def get_order(types, strong_deps, weak_deps, gt, rev_strong_deps=None, rev_weak_
             rwd_count = len(rev_weak_deps[tname])
             is_structunion = type(types[tname]) == StructureType
 
-            #print("DBG: Try with", tname, sd_count, wd_count, rsd_count, rwd_count, is_structunion)
             # first go through the ones we know we can, that have no dependencies
 
             if sd_count + wd_count == 0:
@@ -650,10 +661,9 @@ def get_order(types, strong_deps, weak_deps, gt, rev_strong_deps=None, rev_weak_
             continue
 
         # fwd declare best
-        #TODO do we have to search multiple possibilities? Or isn't this enough?
 
         if best is None:
-            print("DEBUG: Unable to move forward")
+            print("Error: Unable to move forward")
             print(predefd)
             for tname in strong_deps:
                 print(tname, strong_deps[tname], weak_deps[tname], sep='\n\t')
@@ -670,7 +680,7 @@ def get_order(types, strong_deps, weak_deps, gt, rev_strong_deps=None, rev_weak_
     return order
 
 def export_some(bv):
-    types_f = MultilineTextField("Type Names (newline separated)")
+    types_f = MultilineTextField("Type Names (newline separated, * allowed)")
     rec_f = ChoiceField("Include Dependant Types", ["Yes", "No"], 0)
     dbg_f = ChoiceField("Use Only Debug Types", ["Yes", "No"], 1)
     pre_f = TextLineField("Class Name Prefix", "")
@@ -680,7 +690,34 @@ def export_some(bv):
     if types_f.result is None or len(types_f.result) == 0:
         return False
 
-    typenames = [x.strip() for x in types_f.result.split('\n')]
+    typesstr = types_f.result
+
+    typenames = []
+    if '*' in typesstr or '?' in typesstr or '[' in typesstr:
+        allnames = [x.strip() for x in typesstr.split('\n')]
+
+        # get all type names, then do blob checks against all them
+        alltypes = []
+        for id in bv.type_container.types.keys():
+            # can I just str a QualifiedName like this? I think so
+            alltypes.append(str(bv.type_container.get_type_name(id)))
+
+        globnames = []
+        typenames = set()
+        for b in allnames:
+            if '*' not in b and '?' not in b and '[' not in b:
+                typenames.append(b)
+            else:
+                globnames.append(b)
+
+        for tname in alltypes:
+            for b in globnames:
+                if fnmatch.fnmatch(tname, b):
+                    typenames.add(tname)
+                    break
+        typenames = list(typenames)
+    else:
+        typenames = [x.strip() for x in typesstr.split('\n')]
 
     gt_choice = get_type_dbg if dbg_f.result == 0 else get_type
 
@@ -719,13 +756,13 @@ def export_some(bv):
         strong_deps[tname] = strong_tdeps
         weak_deps[tname] = weak_tdeps
 
-        print("DBG:", tname, "strong:", strong_deps[tname])
-        print("DBG:", tname, "weak:", weak_deps[tname])
+        #print("DBG:", tname, "strong:", strong_deps[tname])
+        #print("DBG:", tname, "weak:", weak_deps[tname])
 
     # now start generating our type definitions
 
     # first we need to find an order that works
-    types_order = get_order(types, strong_deps, weak_deps, gt)
+    types_order = get_order(types, strong_deps, weak_deps)
 
     report = header_template
     prefix = pre_f.result
@@ -756,7 +793,6 @@ def export_some(bv):
     return True
 
 #TODO
-# - Option or command or blob pattern matching for exporting all types
 # - Option to export a whole type archive
 
 PluginCommand.register("Export types to ctypes", "Export one or more types to ctypes", export_some)

@@ -5,6 +5,9 @@ _This plugin exports ctypes definitions for given structures._
 
 ## Description:
 Attempts to export specified types to python ctypes definitions, along with enums. It can gather and define all the dependent types as well.
+Supports wildcard (`*`) in type names.
+
+Currently chokes on some kinds of nested anonymous types.
 
 ## License
 
