@@ -155,7 +155,6 @@ def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
             equiv = f"{prefix}{tref.name}"
     else:
         # ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType
-        print("line for", parent, structmem, nth)
         equiv = get_ctypes_equiv(structmem.type, prefix, parent, nth)
 
     if len(comment) > 0:
@@ -710,6 +709,8 @@ def export_some(bv):
 
     if types_f.result is None or len(types_f.result) == 0:
         return False
+
+    #TODO show loading bar
 
     typesstr = types_f.result
 
