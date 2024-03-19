@@ -15,15 +15,29 @@ structunion_declaration_template = """class {madetypename}({kind}):
 
 """
 
-structunion_template = """class {madetypename}({kind}):
+structunion_template_assert = """class {madetypename}({kind}):
     _pack_ = 1
     _fields_ = [
 {items}    ]
 
 """
 
+structunion_template = """class {madetypename}({kind}):
+    _pack_ = 1
+    _fields_ = [
+{items}    ]
+assert ctypes.sizeof({madetypename}) == {size}
+
+"""
+
+structunion_definition_template_assert = """{madetypename}._fields_ = [
+{items}    ]
+
+"""
+
 structunion_definition_template = """{madetypename}._fields_ = [
 {items}    ]
+assert ctypes.sizeof({madetypename}) == {size}
 
 """
 
@@ -177,9 +191,19 @@ def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
 
 def get_union_items(tobj, tname, prefix):
     items = ""
+    maxlen = 0
     for i in range(len(tobj.members)):
         m = tobj.members[i]
+        if m.type.width > maxlen:
+            maxlen = m.type.width
         items += structunion_line(m, i, tname, tobj, prefix)
+
+    # pad to correct size
+    if maxlen > tobj.width:
+        print(f"Warning, union {tname} is too large, is {maxlen} bytes, but should be {tobj.width} bytes")
+
+    if maxlen < tobj.width:
+        items += structunion_line_template.format(name=f"_pad_to_0x{tobj.width:x}", equiv=f"ctypes.c_uint8 * 0x{tobj.width:x}", comment="")
 
     return items
 
@@ -191,8 +215,9 @@ def get_struct_items(tobj, tname, prefix):
         m = tobj.members[i]
         if offset > m.offset:
             # raise RuntimeError(f"Offsets disagree in structure?\n{offset} {m.offset}\n{repr(tobj.members)}")
-            # apperantly this can happen, just go with it
-            pass
+            # apperantly this can happen sometimes?
+            # we could convert this into a union, but for now just skip this other item
+            continue
         while offset < m.offset:
             # add padding
             #TODO compress padding over a certain length to an array
@@ -319,7 +344,7 @@ def declaration(typename, typeobj, prefix, declared, gt):
     # STRUCT and UNION
     return structunion_declaration_template.format(madetypename=make_type_name(typename, prefix), kind=kind.baseclass()), True
 
-def part_definition(typename, typeobj, prefix):
+def part_definition(typename, typeobj, prefix, do_asserts):
     kind = get_type_kind(typeobj, typename)
 
     if kind == TypeKind.ENUM:
@@ -338,9 +363,13 @@ def part_definition(typename, typeobj, prefix):
         items = get_union_items(typeobj, typename, prefix)
 
     # this doesn't always work, if the type or an alias are used as a non-pointer before this
-    return preitems + structunion_definition_template.format(madetypename=make_type_name(typename, prefix), items=items)
+    if do_asserts:
+        return preitems + structunion_definition_template_assert.format(madetypename=make_type_name(typename, prefix), items=items, size=typeobj.width)
+    else:
+        return preitems + structunion_definition_template.format(madetypename=make_type_name(typename, prefix), items=items)
+        
 
-def full_definition(typename, typeobj, prefix):
+def full_definition(typename, typeobj, prefix, do_asserts):
     kind = get_type_kind(typeobj, typename)
 
     if kind in [TypeKind.STRUCT, TypeKind.UNION]:
@@ -353,7 +382,10 @@ def full_definition(typename, typeobj, prefix):
         elif kind == TypeKind.UNION:
             items = get_union_items(typeobj, typename, prefix)
 
-        return preitems + structunion_template.format(madetypename=make_type_name(typename, prefix), kind=kind.baseclass(), items=items)
+        if do_asserts:
+            return preitems + structunion_template_assert.format(madetypename=make_type_name(typename, prefix), kind=kind.baseclass(), items=items, size=typeobj.width)
+        else:
+            return preitems + structunion_template.format(madetypename=make_type_name(typename, prefix), kind=kind.baseclass(), items=items)
 
     if kind == TypeKind.ENUM:
         items = get_enum_items(typeobj)
@@ -640,13 +672,15 @@ def export_some(bv):
     types_f = MultilineTextField("Type Names (newline separated, * allowed)")
     rec_f = ChoiceField("Include Dependant Types", ["Yes", "No"], 0)
     dbg_f = ChoiceField("Use Only Debug Types", ["Yes", "No"], 1)
+    chk_f = ChoiceField("Add Size Asserts", ["Yes", "No"], 0)
     pre_f = TextLineField("Class Name Prefix", "")
     out_f = SaveFileNameField("Output File", "py", "")
-    get_form_input([types_f, rec_f, dbg_f, pre_f, out_f], "Type Export")
+    get_form_input([types_f, rec_f, dbg_f, chk_f, pre_f, out_f], "Type Export")
 
     if types_f.result is None or len(types_f.result) == 0:
         return False
 
+    do_asserts = chk_f.result == 0
 
     gt_choice = get_type_dbg if dbg_f.result == 0 else get_type
 
@@ -697,6 +731,7 @@ def export_some(bv):
         tobj = gt(tname)
         if tobj is None:
             print(f"Error: Could not find type {tname}")
+            show_message_box("Missing Type", f"Could not find needed type: {tname}", MessageBoxButtonSet.OKButtonSet, MessageBoxIcon.ErrorIcon)
             # this is a problem if this is a dependent type
             # this usually happens when we try to force debuginfo types
             # so we just fall back to all types
@@ -737,9 +772,9 @@ def export_some(bv):
     # gen report from order and types
     for tname, linekind in types_order:
         if linekind == DefType.FULL:
-            report += full_definition(tname, types[tname], prefix)
+            report += full_definition(tname, types[tname], prefix, do_asserts)
         elif linekind == DefType.PART:
-            report += part_definition(tname, types[tname], prefix)
+            report += part_definition(tname, types[tname], prefix, do_asserts)
         else:
             decl, _ = declaration(tname, types[tname], prefix, declared, gt)
             report += decl
