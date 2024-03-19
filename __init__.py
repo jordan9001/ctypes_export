@@ -1,5 +1,6 @@
 from binaryninja import *
 import fnmatch
+import string
 import enum
 
 header_template = """# generated from ctypes_export plugin
@@ -9,19 +10,19 @@ import ctypes
 
 """
 
-structunion_declaration_template = """class {prefix}{typename}({kind}):
+structunion_declaration_template = """class {madetypename}({kind}):
     _pack_ = 1
 
 """
 
-structunion_template = """class {prefix}{typename}({kind}):
+structunion_template = """class {madetypename}({kind}):
     _pack_ = 1
     _fields_ = [
 {items}    ]
 
 """
 
-structunion_definition_template = """{prefix}{typename}._fields_ = [
+structunion_definition_template = """{madetypename}._fields_ = [
 {items}    ]
 
 """
@@ -29,22 +30,25 @@ structunion_definition_template = """{prefix}{typename}._fields_ = [
 structunion_line_template = """        ('{name}', {equiv}),{comment}
 """
 
-enum_template = """class {prefix}{typename}_ENUM(enum.IntEnum):
+enum_template = """class {madetypename}__ENUM(enum.IntEnum):
 {items}
 
-{prefix}{typename} = ctypes.c_uint{intsz}
+{madetypename} = ctypes.c_uint{intsz}
 """
 
 enum_line_template = """    {name} = 0x{val:x}
 """
 
-alias_declaration_template = """# Forward declaration for {prefix}{typename}
+EMPTY_ITEMS = """    pass
+"""
+
+alias_declaration_template = """# Forward declaration for {madetypename}
 # {real}
-{prefix}{typename} = {equiv}
+{madetypename} = {equiv}
 
 """
 
-alias_template = """{prefix}{typename} = {equiv}
+alias_template = """{madetypename} = {equiv}
 
 """
 
@@ -94,6 +98,17 @@ def get_type_kind(tobj, tname):
     
     raise NotImplementedError(f"Unimplemented export of type with tobj_type {tobj_type}")
 
+valid_var_letters = string.ascii_letters + string.digits + '_'
+def make_type_name(name, prefix):
+    name = str(name)
+    name = ''.join([(x if x in valid_var_letters else '_') for x in name])
+
+    name = prefix + name
+    # if the name starts with a double under python does mangling, so prevent that
+    if name.startswith("__"):
+        name = "_q" + name 
+    return name
+
 def make_anon_name(structmem, nth, parent, parent_type):
     name = ""
     if isinstance(nth, str):
@@ -125,7 +140,6 @@ def get_structunion_preitems(tobj, tname, prefix):
 
                 if type(c) in [StructureType, EnumerationType]:
                     name = make_anon_name(None, i, tname, None)
-                    print("OUTPUT", name)
                     report += full_definition(name, c, prefix)
                 elif type(c) in [ArrayType, FunctionType, PointerType]:
                     for j in range(len(c.children)):
@@ -144,15 +158,15 @@ def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
     # if it is a structure or enum or named type, we can use our name
     if mobj_type == NamedTypeReferenceType:
         # use the name
-        equiv = f"{prefix}{structmem.type.name}"
+        equiv = make_type_name(structmem.type.name, prefix)
     elif mobj_type == StructureType:
         equiv = prefix + make_anon_name(structmem, nth, parent, parent_type)
     elif mobj_type == EnumerationType:
         tref = structmem.type.registered_name
         if tref is None:
-            equiv = prefix + make_anon_name(structmem, nth, parent, parent_type)
+            equiv = make_type_name(make_anon_name(structmem, nth, parent, parent_type), prefix)
         else:
-            equiv = f"{prefix}{tref.name}"
+            equiv = make_type_name(tref.name, prefix)
     else:
         # ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType
         equiv = get_ctypes_equiv(structmem.type, prefix, parent, nth)
@@ -163,7 +177,6 @@ def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
 
 def get_union_items(tobj, tname, prefix):
     items = ""
-
     for i in range(len(tobj.members)):
         m = tobj.members[i]
         items += structunion_line(m, i, tname, tobj, prefix)
@@ -177,7 +190,9 @@ def get_struct_items(tobj, tname, prefix):
     for i in range(len(tobj.members)):
         m = tobj.members[i]
         if offset > m.offset:
-            raise RuntimeError(f"Offsets disagree in structure?\n{offset} {m.offset}\n{repr(tobj.members)}")
+            # raise RuntimeError(f"Offsets disagree in structure?\n{offset} {m.offset}\n{repr(tobj.members)}")
+            # apperantly this can happen, just go with it
+            pass
         while offset < m.offset:
             # add padding
             #TODO compress padding over a certain length to an array
@@ -199,6 +214,8 @@ def get_struct_items(tobj, tname, prefix):
 def get_enum_items(tobj):
     # define enum options
     items = ""
+    if len(tobj.members) == 0:
+        return EMPTY_ITEMS
     for m in tobj.members:
         items += enum_line_template.format(name=m.name, val=m.value)
 
@@ -209,7 +226,7 @@ def equiv_basetype(tobj, prefix, declared, gt):
     # deref all the way and get the best fit
     while type(tobj) == NamedTypeReferenceType:
         if tobj.name in declared:
-            return prefix + tobj.name
+            return make_type_name(tobj.name, prefix)
         tobj = gt(tobj.name)
 
     # now, depending on the type, we can set something up
@@ -220,7 +237,7 @@ def equiv_basetype(tobj, prefix, declared, gt):
         if tobj.registered_name is None or tobj.registered_name.name not in declared:
             return f"ctypes.c_uint{tobj.width * 8}"
         else:
-            return prefix + tobj.registered_name.name
+            return make_type_name(tobj.registered_name.name, prefix)
 
     # otherwise drill down a bit more as possible
     return get_ctypes_equiv(tobj, prefix, tobj.name, 0, declared, gt)
@@ -233,7 +250,7 @@ def get_ctypes_equiv(tobj, prefix, parent, nth, declared=None, gt=None):
     if tobj_type == NamedTypeReferenceType:
         if declared is not None and tobj.name not in declared:
             return equiv_basetype(tobj, prefix, declared, gt)
-        return f"{prefix}{tobj.name}"
+        return make_type_name(tobj.name, prefix)
     elif tobj_type == ArrayType:
         subtype = get_ctypes_equiv(tobj.element_type, prefix, parent, f"{nth}_0", declared, gt)
         return f"({subtype}) * {tobj.count}"
@@ -277,7 +294,7 @@ def get_ctypes_equiv(tobj, prefix, parent, nth, declared=None, gt=None):
         return "ctypes.c_void_p"
     elif tobj_type in [StructureType, EnumerationType]:
         # this seems a brittle way to do this :/
-        name =  make_anon_name(None, str(nth), parent, None)
+        name =  make_type_name(make_anon_name(None, str(nth), parent, None), prefix)
         return name
     else:
         # not in NamedTypeReference, ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, WideCharType
@@ -297,10 +314,10 @@ def declaration(typename, typeobj, prefix, declared, gt):
         # so we alias to some equivalent type that is the same width
         fake_equiv = get_ctypes_equiv(typeobj, prefix, typename, 0, declared, gt)
 
-        return alias_declaration_template.format(real=real, prefix=prefix, typename=typename, equiv=fake_equiv), True
+        return alias_declaration_template.format(real=real, madetypename=make_type_name(typename, prefix), equiv=fake_equiv), True
 
     # STRUCT and UNION
-    return structunion_declaration_template.format(prefix=prefix, typename=typename, kind=kind.baseclass()), True
+    return structunion_declaration_template.format(madetypename=make_type_name(typename, prefix), kind=kind.baseclass()), True
 
 def part_definition(typename, typeobj, prefix):
     kind = get_type_kind(typeobj, typename)
@@ -321,7 +338,7 @@ def part_definition(typename, typeobj, prefix):
         items = get_union_items(typeobj, typename, prefix)
 
     # this doesn't always work, if the type or an alias are used as a non-pointer before this
-    return preitems + structunion_definition_template.format(prefix=prefix, typename=typename, items=items)
+    return preitems + structunion_definition_template.format(madetypename=make_type_name(typename, prefix), items=items)
 
 def full_definition(typename, typeobj, prefix):
     kind = get_type_kind(typeobj, typename)
@@ -336,15 +353,15 @@ def full_definition(typename, typeobj, prefix):
         elif kind == TypeKind.UNION:
             items = get_union_items(typeobj, typename, prefix)
 
-        return preitems + structunion_template.format(prefix=prefix, typename=typename, kind=kind.baseclass(), items=items)
+        return preitems + structunion_template.format(madetypename=make_type_name(typename, prefix), kind=kind.baseclass(), items=items)
 
     if kind == TypeKind.ENUM:
         items = get_enum_items(typeobj)
-        return enum_template.format(prefix=prefix, typename=typename, items=items, intsz=(typeobj.width * 8))
+        return enum_template.format(madetypename=make_type_name(typename, prefix), items=items, intsz=(typeobj.width * 8))
 
     if kind == TypeKind.ALIAS:
         equiv = get_ctypes_equiv(typeobj, prefix, typename, 0)
-        return alias_template.format(prefix=prefix, typename=typename, equiv=equiv)
+        return alias_template.format(madetypename=make_type_name(typename, prefix), equiv=equiv)
     raise NotImplementedError(f"Unimplemented definition for kind {kind}")
 
 def get_type_dbg(bv, typename):
@@ -511,90 +528,6 @@ def get_order(types, strong_deps, weak_deps, rev_strong_deps=None, rev_weak_deps
 
             # otherwise we have gone through those we can do safely
             # now we need to choose something to forward declare to keep things moving
-            
-
-            """
-            pt1 = *t1
-            t2 { pt1, t1 }
-            t3 { t1 }
-            t1 { t2 }
-
-            t1:
-                sd t2
-                wd 
-                rsd t3
-                rwd pt1
-            t2:
-                sd pt1
-                wd
-                rsd t1
-                rwd
-            t3: 
-                sd t1
-                wd
-                rsd
-                rwd
-            pt1:
-                sd
-                wd t1
-                rsd t2
-                rwd 
-
-            -- t1 fwd declared -- 
-
-            t1:
-                sd t2
-                rsd t3
-            t2:
-                sd pt1
-                wd
-                rsd t1
-                rwd
-            t3: 
-                sd t1
-                wd
-                rsd
-                rwd
-            pt1:
-                sd
-                wd
-                rsd t2
-                rwd
-
-            -- pt1 declared --
-
-            t1:
-                sd t2
-                rsd t3
-            t2:
-                sd
-                wd
-                rsd t1
-                rwd
-            t3: 
-                sd t1
-                wd
-                rsd
-                rwd
-
-            -- t2 declared -- 
-
-            t1:
-                sd
-                rsd t3
-            t3: 
-                sd t1
-                wd
-                rsd
-                rwd
-
-            -- t1 declared --
-
-            -- t3 declared -- 
-            
-            
-            
-            """
 
             # we want to end up with a ordered list of what we want to try to fwd decalre
             # it should be like:
