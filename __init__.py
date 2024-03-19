@@ -96,7 +96,9 @@ def get_type_kind(tobj, tname):
 
 def make_anon_name(structmem, nth, parent, parent_type):
     name = ""
-    if parent_type.type == StructureVariant.UnionStructureType:
+    if isinstance(nth, str):
+        name = f'{parent}__n{nth}'
+    elif parent_type.type == StructureVariant.UnionStructureType:
         # can't use offset, have to use order index
         name = f'{parent}__u{nth}'
     else:
@@ -112,7 +114,22 @@ def get_structunion_preitems(tobj, tname, prefix):
             # this is not a NamedTypeReferenceType so it must be anonymous
             name = make_anon_name(m, i, tname, tobj)
             report += full_definition(name, m.type, prefix)
-        #TODO handle unnamed structures used in pointer, arrays, functions
+        elif type(m.type) in [ArrayType, FunctionType, PointerType]:
+            # handle unnamed structures/enums used in pointers, arrays, functions
+            # may require some recursing
+            rec_list = [(f"{i}_{ii}",m.type.children[ii]) for ii in range(len(m.type.children))]
+
+            while len(rec_list) > 0:
+                i, c = rec_list[0]
+                del rec_list[0]
+
+                if type(c) in [StructureType, EnumerationType]:
+                    name = make_anon_name(None, i, tname, None)
+                    print("OUTPUT", name)
+                    report += full_definition(name, c, prefix)
+                elif type(c) in [ArrayType, FunctionType, PointerType]:
+                    for j in range(len(c.children)):
+                        rec_list.append((f"{i}_{j}", c.children[j]))
     
     return report
 
@@ -138,10 +155,11 @@ def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
             equiv = f"{prefix}{tref.name}"
     else:
         # ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, VoidType, WideCharType
-        equiv = get_ctypes_equiv(structmem.type, prefix)
+        print("line for", parent, structmem, nth)
+        equiv = get_ctypes_equiv(structmem.type, prefix, parent, nth)
 
     if len(comment) > 0:
-        comment = '# ' + comment
+        comment = ' # ' + comment
     return structunion_line_template.format(name=name, equiv=equiv, comment=comment)
 
 def get_union_items(tobj, tname, prefix):
@@ -206,9 +224,9 @@ def equiv_basetype(tobj, prefix, declared, gt):
             return prefix + tobj.registered_name.name
 
     # otherwise drill down a bit more as possible
-    return get_ctypes_equiv(tobj, prefix, declared, gt)
+    return get_ctypes_equiv(tobj, prefix, tobj.name, 0, declared, gt)
 
-def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
+def get_ctypes_equiv(tobj, prefix, parent, nth, declared=None, gt=None):
     # get ctypes equivalent string
     # if declared is not None, it means we want to do our best, but fall back to base types
 
@@ -218,7 +236,7 @@ def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
             return equiv_basetype(tobj, prefix, declared, gt)
         return f"{prefix}{tobj.name}"
     elif tobj_type == ArrayType:
-        subtype = get_ctypes_equiv(tobj.element_type, prefix, declared, gt)
+        subtype = get_ctypes_equiv(tobj.element_type, prefix, parent, f"{nth}_0", declared, gt)
         return f"({subtype}) * {tobj.count}"
     elif tobj_type in [BoolType, CharType, IntegerType, WideCharType]:
         signed = False
@@ -238,7 +256,7 @@ def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
         if declared is not None and type(targ) == NamedTypeReferenceType and targ.name not in declared:
             return "ctypes.c_void_p"
 
-        subtype = get_ctypes_equiv(tobj.target, prefix, declared, gt)
+        subtype = get_ctypes_equiv(tobj.target, prefix, parent, f"{nth}_0", declared, gt)
         return f"ctypes.POINTER({subtype})"
     elif tobj_type == FloatType:
         floatsz = "float"
@@ -250,20 +268,23 @@ def get_ctypes_equiv(tobj, prefix, declared=None, gt=None):
             raise NotImplementedError(f"Unknown float with width {tobj.width} {repr(tobj)}")
         return f"ctypes.c_{floatsz}"
     elif tobj_type == FunctionType:
-        restype = get_ctypes_equiv(tobj.return_value, prefix, declared, gt)
-        argtypes = ','.join([get_ctypes_equiv(x.type, prefix, declared, gt) for x in tobj.parameters])
+        restype = get_ctypes_equiv(tobj.return_value, prefix, parent, f"{nth}_0", declared, gt)
+        argtypes = ','.join([get_ctypes_equiv(tobj.parameters[i].type, prefix, parent, f"{nth}_{i+1}", declared, gt) for i in range(len(tobj.parameters))])
         #TODO calling convention information instead of just CFUNCTYPE
         return f"ctypes.CFUNCTYPE(({restype}), {argtypes})"
     elif tobj_type == VoidType:
         # probably a function return value
         # just use void* whatever
         return "ctypes.c_void_p"
-
+    elif tobj_type in [StructureType, EnumerationType]:
+        # this seems a brittle way to do this :/
+        name =  make_anon_name(None, str(nth), parent, None)
+        return name
     else:
-        #TODO handle arrays of anon structures and such predefined in preitems
         # not in NamedTypeReference, ArrayType, BoolType, CharType, FloatType, FunctionType, IntegerType, PointerType, WideCharType
-        raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}")
-
+        maybename =  make_anon_name(None, str(nth), parent, None)
+        raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}, {maybename}")
+    
 def declaration(typename, typeobj, prefix, declared, gt):
     kind = get_type_kind(typeobj, typename)
 
@@ -275,7 +296,7 @@ def declaration(typename, typeobj, prefix, declared, gt):
         # I can't forward declare aliases the way I am doing them
         # but I can't full define them, because they can have dependencies
         # so we alias to some equivalent type that is the same width
-        fake_equiv = get_ctypes_equiv(typeobj, prefix, declared, gt)
+        fake_equiv = get_ctypes_equiv(typeobj, prefix, typename, 0, declared, gt)
 
         return alias_declaration_template.format(real=real, prefix=prefix, typename=typename, equiv=fake_equiv), True
 
@@ -323,7 +344,7 @@ def full_definition(typename, typeobj, prefix):
         return enum_template.format(prefix=prefix, typename=typename, items=items, intsz=(typeobj.width * 8))
 
     if kind == TypeKind.ALIAS:
-        equiv = get_ctypes_equiv(typeobj, prefix)
+        equiv = get_ctypes_equiv(typeobj, prefix, typename, 0)
         return alias_template.format(prefix=prefix, typename=typename, equiv=equiv)
     raise NotImplementedError(f"Unimplemented definition for kind {kind}")
 
