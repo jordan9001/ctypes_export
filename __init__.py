@@ -1,7 +1,7 @@
-from binaryninja import *
 import fnmatch
 import string
 import enum
+from binaryninja import *
 
 header_template = """# generated from ctypes_export plugin
 # report issues to https://github.com/jordan9001/ctypes_export/issues
@@ -364,18 +364,22 @@ def full_definition(typename, typeobj, prefix):
         return alias_template.format(madetypename=make_type_name(typename, prefix), equiv=equiv)
     raise NotImplementedError(f"Unimplemented definition for kind {kind}")
 
+def get_type(bv, typename):
+    # should we check and warn if there is a _1 variant?
+    return bv.get_type_by_name(typename)
+
 def get_type_dbg(bv, typename):
-    res = bv.debug_info.get_types_by_name(typename)
+    #TODO for some reason some types end up on a path that forces the non-dbg version even when the other exists
+
+    res = bv.debug_info.get_types_by_name(str(typename))
     if len(res) == 0:
-        return None
+        # try falling back to the rest of the types
+        return get_type(bv, typename)
+        #return None
     if len(res) > 1:
         print(f"Warning: type '{typename}' is provided by multiple debug parsers: {', '.join([x[0] for x in res])}")
 
     return res[0][1]
-
-def get_type(bv, typename):
-    # should we check and warn if there is a _1 variant?
-    return bv.get_type_by_name(typename)
 
 def is_ptr_alias(tobj, gt):
     while type(tobj) == NamedTypeReferenceType:
@@ -643,7 +647,10 @@ def export_some(bv):
     if types_f.result is None or len(types_f.result) == 0:
         return False
 
-    #TODO show loading bar
+
+    gt_choice = get_type_dbg if dbg_f.result == 0 else get_type
+
+    gt = lambda tname: gt_choice(bv, tname)
 
     typesstr = types_f.result
 
@@ -653,9 +660,12 @@ def export_some(bv):
 
         # get all type names, then do blob checks against all them
         alltypes = []
-        for id in bv.type_container.types.keys():
-            # can I just str a QualifiedName like this? I think so
-            alltypes.append(str(bv.type_container.get_type_name(id)))
+        if dbg_f.result == 0:
+            alltypes = [x[0] for x in bv.debug_info.types]
+        else:
+            for id in bv.type_container.types.keys():
+                # can I just str a QualifiedName like this? I think so
+                alltypes.append(str(bv.type_container.get_type_name(id)))
 
         globnames = []
         typenames = set()
@@ -674,9 +684,7 @@ def export_some(bv):
     else:
         typenames = [x.strip() for x in typesstr.split('\n')]
 
-    gt_choice = get_type_dbg if dbg_f.result == 0 else get_type
-
-    gt = lambda tname: gt_choice(bv, tname)
+    #TODO show loading bar
 
     types = {}
     # this is edges for the dependency graph
@@ -689,7 +697,10 @@ def export_some(bv):
         tobj = gt(tname)
         if tobj is None:
             print(f"Error: Could not find type {tname}")
-            continue
+            # this is a problem if this is a dependent type
+            # this usually happens when we try to force debuginfo types
+            # so we just fall back to all types
+            raise KeyError(f"Could not find needed type {tname}")
         types[tname] = tobj
 
         # get dependencies
