@@ -26,7 +26,7 @@ structunion_template = """class {madetypename}({kind}):
     _pack_ = 1
     _fields_ = [
 {items}    ]
-assert ctypes.sizeof({madetypename}) == {size}
+assert ctypes.sizeof({madetypename}) == 0x{size:x}
 
 """
 
@@ -37,7 +37,7 @@ structunion_definition_template_assert = """{madetypename}._fields_ = [
 
 structunion_definition_template = """{madetypename}._fields_ = [
 {items}    ]
-assert ctypes.sizeof({madetypename}) == {size}
+assert ctypes.sizeof({madetypename}) == 0x{size:x}
 
 """
 
