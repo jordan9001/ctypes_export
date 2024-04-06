@@ -8,6 +8,11 @@ header_template = """# generated from ctypes_export plugin
 import enum
 import ctypes
 
+# Generated for the following types:
+'''
+{intypes}
+'''
+
 """
 
 structunion_declaration_template = """class {madetypename}({kind}):
@@ -15,14 +20,14 @@ structunion_declaration_template = """class {madetypename}({kind}):
 
 """
 
-structunion_template_assert = """class {madetypename}({kind}):
+structunion_template = """class {madetypename}({kind}):
     _pack_ = 1
     _fields_ = [
 {items}    ]
 
 """
 
-structunion_template = """class {madetypename}({kind}):
+structunion_template_assert= """class {madetypename}({kind}):
     _pack_ = 1
     _fields_ = [
 {items}    ]
@@ -30,12 +35,12 @@ assert ctypes.sizeof({madetypename}) == 0x{size:x}
 
 """
 
-structunion_definition_template_assert = """{madetypename}._fields_ = [
+structunion_definition_template = """{madetypename}._fields_ = [
 {items}    ]
 
 """
 
-structunion_definition_template = """{madetypename}._fields_ = [
+structunion_definition_template_assert = """{madetypename}._fields_ = [
 {items}    ]
 assert ctypes.sizeof({madetypename}) == 0x{size:x}
 
@@ -46,14 +51,15 @@ structunion_line_template = """        ('{name}', {equiv}),{comment}
 
 enum_template = """class {madetypename}__ENUM(enum.IntEnum):
 {items}
-
 {madetypename} = ctypes.c_uint{intsz}
+
 """
 
 enum_line_template = """    {name} = 0x{val:x}
 """
 
 EMPTY_ITEMS = """    pass
+
 """
 
 alias_declaration_template = """# Forward declaration for {madetypename}
@@ -134,7 +140,7 @@ def make_anon_name(structmem, nth, parent, parent_type):
         name = f'{parent}__0x{structmem.offset:x}'
     return name
 
-def get_structunion_preitems(tobj, tname, prefix):
+def get_structunion_preitems(tobj, tname, prefix, do_asserts):
     report = ""
     # define anonymous structures and unions for this type
     for i in range(len(tobj.members)):
@@ -142,7 +148,7 @@ def get_structunion_preitems(tobj, tname, prefix):
         if type(m.type) in [StructureType, EnumerationType]:
             # this is not a NamedTypeReferenceType so it must be anonymous
             name = make_anon_name(m, i, tname, tobj)
-            report += full_definition(name, m.type, prefix)
+            report += full_definition(name, m.type, prefix, do_asserts)
         elif type(m.type) in [ArrayType, FunctionType, PointerType]:
             # handle unnamed structures/enums used in pointers, arrays, functions
             # may require some recursing
@@ -154,7 +160,7 @@ def get_structunion_preitems(tobj, tname, prefix):
 
                 if type(c) in [StructureType, EnumerationType]:
                     name = make_anon_name(None, i, tname, None)
-                    report += full_definition(name, c, prefix)
+                    report += full_definition(name, c, prefix, do_asserts)
                 elif type(c) in [ArrayType, FunctionType, PointerType]:
                     for j in range(len(c.children)):
                         rec_list.append((f"{i}_{j}", c.children[j]))
@@ -174,7 +180,7 @@ def structunion_line(structmem, nth, parent, parent_type, prefix, comment=""):
         # use the name
         equiv = make_type_name(structmem.type.name, prefix)
     elif mobj_type == StructureType:
-        equiv = prefix + make_anon_name(structmem, nth, parent, parent_type)
+        equiv = make_type_name(make_anon_name(structmem, nth, parent, parent_type), prefix)
     elif mobj_type == EnumerationType:
         tref = structmem.type.registered_name
         if tref is None:
@@ -207,6 +213,40 @@ def get_union_items(tobj, tname, prefix):
 
     return items
 
+def struct_padding(offset, size):
+    items = ""
+    end = offset + size
+    while offset < end:
+        sz = 0
+        allsz = end - offset
+        pt = ""
+        equiv = ""
+        # if align to 0x4
+        # then align to 0x8 with a c_uint4
+        # then fill with array in 0x10 sizes
+        # then fill the rest
+        if allsz < 4 or (offset & 0x3) != 0:
+            sz = 1
+            pt = ""
+            equiv = "ctypes.c_uint8"
+        elif allsz < 8 or (offset & 0x7) != 0:
+            sz = 4
+            pt = "4"
+            equiv = "ctypes.c_uint32"
+        elif allsz < 0x10:
+            sz = 8
+            pt = "8"
+            equiv = "ctypes.c_uint64"
+        else:
+            sz = (end - offset) & (~(0x10 - 1))
+            pt = "arr"
+            equiv = f"ctypes.c_uint8 * 0x{sz:x}"
+        
+        items += structunion_line_template.format(name=f"pad_{pt}_0x{offset:x}", equiv=equiv, comment="")
+        offset += sz
+        
+    return items
+
 def get_struct_items(tobj, tname, prefix):
     items = ""
     # define fields
@@ -220,9 +260,9 @@ def get_struct_items(tobj, tname, prefix):
             continue
         while offset < m.offset:
             # add padding
-            #TODO compress padding over a certain length to an array
-            items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8", comment="")
-            offset += 1
+            padsize = m.offset - offset
+            items += struct_padding(offset, padsize)
+            offset += padsize
 
         # add item
         items += structunion_line(m, i, tname, tobj, prefix, comment=f"0x{offset:x}")
@@ -230,9 +270,10 @@ def get_struct_items(tobj, tname, prefix):
         
     # pad at end
     while offset < tobj.width:
-        #TODO compress padding over a certain length to an array
-        items += structunion_line_template.format(name=f"pad_0x{offset:x}", equiv="ctypes.c_uint8", comment="")
-        offset += 1
+        # add padding
+        padsize = tobj.width - offset
+        items += struct_padding(offset, padsize)
+        offset += padsize
 
     return items
 
@@ -241,8 +282,10 @@ def get_enum_items(tobj):
     items = ""
     if len(tobj.members) == 0:
         return EMPTY_ITEMS
+    # assumes no weird widths?
+    mask = (( 1 << (8 * tobj.width)) - 1)
     for m in tobj.members:
-        items += enum_line_template.format(name=m.name, val=m.value)
+        items += enum_line_template.format(name=m.name, val=m.value & mask)
 
     return items
 
@@ -326,14 +369,14 @@ def get_ctypes_equiv(tobj, prefix, parent, nth, declared=None, gt=None):
         maybename =  make_anon_name(None, str(nth), parent, None)
         raise NotImplementedError(f"Unimplemented type type in get_ctypes_equiv: {repr(tobj)}, {maybename}")
     
-def declaration(typename, typeobj, prefix, declared, gt):
+def declaration(typename, typeobj, prefix, declared, gt, do_asserts):
     kind = get_type_kind(typeobj, typename)
 
     if kind == TypeKind.ENUM:
-        return full_definition(typename, typeobj, prefix), False
+        return full_definition(typename, typeobj, prefix, do_asserts), False
 
     if kind == TypeKind.ALIAS:
-        real = full_definition(typename, typeobj, prefix)
+        real = full_definition(typename, typeobj, prefix, do_asserts)
         # I can't forward declare aliases the way I am doing them
         # but I can't full define them, because they can have dependencies
         # so we alias to some equivalent type that is the same width
@@ -352,9 +395,9 @@ def part_definition(typename, typeobj, prefix, do_asserts):
 
     if kind == TypeKind.ALIAS:
         # overwrite the stand in that has the equivalent sized types
-        return full_definition(typename, typeobj, prefix)
+        return full_definition(typename, typeobj, prefix, do_asserts)
 
-    preitems = get_structunion_preitems(typeobj, typename, prefix)
+    preitems = get_structunion_preitems(typeobj, typename, prefix, do_asserts)
 
     items = ""
     if kind == TypeKind.STRUCT:
@@ -374,7 +417,7 @@ def full_definition(typename, typeobj, prefix, do_asserts):
 
     if kind in [TypeKind.STRUCT, TypeKind.UNION]:
 
-        preitems = get_structunion_preitems(typeobj, typename, prefix)
+        preitems = get_structunion_preitems(typeobj, typename, prefix, do_asserts)
 
         items = ""
         if kind == TypeKind.STRUCT:
@@ -674,7 +717,7 @@ def export_some(bv):
     dbg_f = ChoiceField("Use Only Debug Types", ["Yes", "No"], 1)
     chk_f = ChoiceField("Add Size Asserts", ["Yes", "No"], 0)
     pre_f = TextLineField("Class Name Prefix", "")
-    out_f = SaveFileNameField("Output File", "py", "")
+    out_f = SaveFileNameField("Output File", "Python Files (*.py)", "")
     get_form_input([types_f, rec_f, dbg_f, chk_f, pre_f, out_f], "Type Export")
 
     if types_f.result is None or len(types_f.result) == 0:
@@ -687,13 +730,14 @@ def export_some(bv):
     gt = lambda tname: gt_choice(bv, tname)
 
     typesstr = types_f.result
+    orig_types= typesstr.split('\n')
 
     typenames = []
     if '*' in typesstr or '?' in typesstr or '[' in typesstr:
         allnames = [x.strip() for x in typesstr.split('\n')]
 
         # get all type names, then do blob checks against all them
-        alltypes = []
+        alltypes = []               
         if dbg_f.result == 0:
             alltypes = [x[0] for x in bv.debug_info.types]
         else:
@@ -705,7 +749,7 @@ def export_some(bv):
         typenames = set()
         for b in allnames:
             if '*' not in b and '?' not in b and '[' not in b:
-                typenames.append(b)
+                typenames.add(b)
             else:
                 globnames.append(b)
 
@@ -765,7 +809,7 @@ def export_some(bv):
     # first we need to find an order that works
     types_order = get_order(types, strong_deps, weak_deps)
 
-    report = header_template
+    report = header_template.format(intypes=', '.join(orig_types))
     prefix = pre_f.result
 
     declared = set()
@@ -776,7 +820,7 @@ def export_some(bv):
         elif linekind == DefType.PART:
             report += part_definition(tname, types[tname], prefix, do_asserts)
         else:
-            decl, _ = declaration(tname, types[tname], prefix, declared, gt)
+            decl, _ = declaration(tname, types[tname], prefix, declared, gt, do_asserts)
             report += decl
 
         declared.add(tname)
