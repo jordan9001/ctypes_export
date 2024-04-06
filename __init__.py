@@ -724,12 +724,16 @@ def export_some(bv):
         return False
 
     do_asserts = chk_f.result == 0
+    dbg_only = dbg_f.result == 0
+    do_recurse = rec_f.result == 0
+    prefix = pre_f.result
+    filename = out_f.result
+    typesstr = types_f.result
 
-    gt_choice = get_type_dbg if dbg_f.result == 0 else get_type
+    gt_choice = get_type_dbg if dbg_only else get_type
 
     gt = lambda tname: gt_choice(bv, tname)
 
-    typesstr = types_f.result
     orig_types= typesstr.split('\n')
 
     typenames = []
@@ -738,7 +742,7 @@ def export_some(bv):
 
         # get all type names, then do blob checks against all them
         alltypes = []               
-        if dbg_f.result == 0:
+        if dbg_only:
             alltypes = [x[0] for x in bv.debug_info.types]
         else:
             for id in bv.type_container.types.keys():
@@ -762,80 +766,94 @@ def export_some(bv):
     else:
         typenames = [x.strip() for x in typesstr.split('\n')]
 
-    #TODO show loading bar
+    # show loading bar
 
-    types = {}
-    # this is edges for the dependency graph
-    # because the output has to be in order
-    strong_deps = {}
-    # stong deps are real
-    # weak deps are thorugh pointers
-    weak_deps = {}
-    for tname in typenames:
-        tobj = gt(tname)
-        if tobj is None:
-            print(f"Error: Could not find type {tname}")
-            show_message_box("Missing Type", f"Could not find needed type: {tname}", MessageBoxButtonSet.OKButtonSet, MessageBoxIcon.ErrorIcon)
-            # this is a problem if this is a dependent type
-            # this usually happens when we try to force debuginfo types
-            # so we just fall back to all types
-            raise KeyError(f"Could not find needed type {tname}")
-        types[tname] = tobj
+    def export_types(report_prog):
+        types = {}
+        # this is edges for the dependency graph
+        # because the output has to be in order
+        strong_deps = {}
+        # stong deps are real
+        # weak deps are thorugh pointers
+        weak_deps = {}
+        for tname in typenames:
+            tobj = gt(tname)
+            if tobj is None:
+                print(f"Error: Could not find type {tname}")
+                show_message_box("Missing Type", f"Could not find needed type: {tname}", MessageBoxButtonSet.OKButtonSet, MessageBoxIcon.ErrorIcon)
+                # this is a problem if this is a dependent type
+                # this usually happens when we try to force debuginfo types
+                # so we just fall back to all types
+                raise KeyError(f"Could not find needed type {tname}")
+            types[tname] = tobj
 
-        # get dependencies
-        strong_tdeps, weak_tdeps = get_type_deps(tobj, tname, gt)
+            # get dependencies
+            strong_tdeps, weak_tdeps = get_type_deps(tobj, tname, gt)
 
-        # recurse as needed
-        if rec_f.result == 0:
-            for d in strong_tdeps:
-                if d not in typenames:
-                    typenames.append(d)
-            for d in weak_tdeps:
-                if d not in typenames:
-                    typenames.append(d)
+            # recurse as needed
+            if do_recurse:
+                for d in strong_tdeps:
+                    if d not in typenames:
+                        typenames.append(d)
+                for d in weak_tdeps:
+                    if d not in typenames:
+                        typenames.append(d)
+            else:
+                # if not recursing, we still want good order for deps between included types
+                strong_tdeps = strong_tdeps.intersection(set(typenames))
+                weak_tdeps = weak_tdeps.intersection(set(typenames))
+
+            strong_deps[tname] = strong_tdeps
+            weak_deps[tname] = weak_tdeps
+
+            #print("DBG:", tname, "strong:", strong_deps[tname])
+            #print("DBG:", tname, "weak:", weak_deps[tname])
+
+            if not report_prog(1, len(types)):
+                # cancel
+                return
+
+        # now start generating our type definitions
+        num_alltypes = len(types)
+
+        # first we need to find an order that works
+        types_order = get_order(types, strong_deps, weak_deps)
+
+        report = header_template.format(intypes=', '.join(orig_types))
+
+        declared = set()
+        # gen report from order and types
+        for tname, linekind in types_order:
+            if linekind == DefType.FULL:
+                report += full_definition(tname, types[tname], prefix, do_asserts)
+            elif linekind == DefType.PART:
+                report += part_definition(tname, types[tname], prefix, do_asserts)
+            else:
+                decl, _ = declaration(tname, types[tname], prefix, declared, gt, do_asserts)
+                report += decl
+
+            declared.add(tname)
+
+            if not report_prog(len(declared), num_alltypes):
+                # cancel
+                return
+
+        if len(filename) == 0:
+            show_markdown_report("Type Definitions", markdown_template.format(report=report), report)
         else:
-            # if not recursing, we still want good order for deps between included types
-            strong_tdeps = strong_tdeps.intersection(set(typenames))
-            weak_tdeps = weak_tdeps.intersection(set(typenames))
+            with open(filename, "w") as fp:
+                fp.write(report)
+        
+        print("ctypes export done")
 
-        strong_deps[tname] = strong_tdeps
-        weak_deps[tname] = weak_tdeps
-
-        #print("DBG:", tname, "strong:", strong_deps[tname])
-        #print("DBG:", tname, "weak:", weak_deps[tname])
-
-    # now start generating our type definitions
-
-    # first we need to find an order that works
-    types_order = get_order(types, strong_deps, weak_deps)
-
-    report = header_template.format(intypes=', '.join(orig_types))
-    prefix = pre_f.result
-
-    declared = set()
-    # gen report from order and types
-    for tname, linekind in types_order:
-        if linekind == DefType.FULL:
-            report += full_definition(tname, types[tname], prefix, do_asserts)
-        elif linekind == DefType.PART:
-            report += part_definition(tname, types[tname], prefix, do_asserts)
-        else:
-            decl, _ = declaration(tname, types[tname], prefix, declared, gt, do_asserts)
-            report += decl
-
-        declared.add(tname)
-
-
-    filename = out_f.result
-    if len(filename) == 0:
-        show_markdown_report("Type Definitions", markdown_template.format(report=report), report)
-    else:
-        with open(filename, "w") as fp:
-            fp.write(report)
+        return
     
-    print("ctypes export done")
+    res = run_progress_dialog("Sorting Types", True, export_types)
 
-    return True
+    if not res:
+        print("ctypes export canceled")
+
+    return res
 
 #TODO
 # - Option to export a whole type archive
