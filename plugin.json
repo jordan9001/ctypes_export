@@ -41,7 +41,7 @@
       "The sample plugin requires [this random package](https://bogus-domain/this-package/) be installed."
     ]
   },
-  "version": "0.72",
+  "version": "0.81",
   "author": "Jordan Whitehead",
   "minimumbinaryninjaversion": 3164
 }

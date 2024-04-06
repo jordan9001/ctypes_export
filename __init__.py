@@ -809,7 +809,7 @@ def export_some(bv):
             #print("DBG:", tname, "strong:", strong_deps[tname])
             #print("DBG:", tname, "weak:", weak_deps[tname])
 
-            if not report_prog(1, len(types)):
+            if not report_prog(len(types), len(types) + 300):
                 # cancel
                 return
 
